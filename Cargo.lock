@@ -118,7 +118,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admet-calc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chem-core",
  "rayon",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "admet-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "admet-calc",
  "admet-report",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "admet-report"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "admet-calc",
  "chem-core",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "admetcraft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "admet-calc",
  "admet-engine",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "admetcraft-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "admet-calc",
  "admet-engine",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "chem-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "csv",
  "serde",
