@@ -29,7 +29,7 @@ AdmetCraft distinguishes clearly between published equations/parameters and expe
 ## Security Guarantees
 
 - `#![forbid(unsafe_code)]`, `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` workspace-wide.
-- **No TOCTOU / Symlink Escapes:** `PathSandbox` validates every path component via `symlink_metadata`, rejects live and broken symlinks, opens descriptors with `O_NOFOLLOW | O_NONBLOCK`, verifies `is_file()` on the opened fd (blocking FIFOs/sockets/directories), and writes reports directly to the opened `File`.
+- **Directory Sandbox Isolation:** `PathSandbox` pins `--read-root` / `--write-root` directory file descriptors and opens files atomically via kernel `openat2(..., RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` (with `O_NOFOLLOW | O_NONBLOCK` and regular-file verification before truncation), preventing intermediate-directory symlink races and FIFOs.
 - **DoS & Network Guards:** SMILES parser enforces `DEFAULT_MAX_ATOMS = 2000` with iterative stack-safe canonicalization; MCP caps requests at `1 MiB`, batches at `1,000` molecules, requires `initialize` lifecycle, binds `--tcp` to loopback only unless `--allow-remote` is passed, and requires `--mcp-token` for TCP clients.
 
 ## Building & Testing

@@ -529,10 +529,11 @@ mod tests {
             // 2. Symlinked directory inside write_root pointing outside -> MUST be rejected!
             let sym_dir = write_dir.join("linked_dir");
             symlink(&secret_dir, &sym_dir)?;
-            assert!(matches!(
-                sb.open_write(Path::new("linked_dir/evil.csv")),
-                Err(SandboxError::SymlinkNotAllowed(_))
-            ));
+            let linked_res = sb.open_write(Path::new("linked_dir/evil.csv"));
+            assert!(
+                matches!(linked_res, Err(SandboxError::SymlinkNotAllowed(_))),
+                "expected SymlinkNotAllowed, got: {linked_res:?}"
+            );
             assert!(!secret_dir.join("evil.csv").exists());
 
             // 3. Symlink inside read_root pointing outside -> MUST be rejected!
@@ -563,5 +564,80 @@ mod tests {
             .arg(path.to_str()?)
             .status()?;
         Ok(status.code().unwrap_or(1))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_openat2_blocks_4000_intermediate_directory_symlink_swap_races()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let base = std::env::temp_dir().join("admetcraft_sb_race_4k");
+        let _ = std::fs::remove_dir_all(&base);
+        let read_dir = base.join("read");
+        let write_dir = base.join("write");
+        let outside_dir = base.join("outside");
+        let real_r_sub = read_dir.join("real_sub");
+        let real_w_sub = write_dir.join("real_sub");
+        std::fs::create_dir_all(&real_r_sub)?;
+        std::fs::create_dir_all(&real_w_sub)?;
+        std::fs::create_dir_all(&outside_dir)?;
+        std::fs::write(real_r_sub.join("target.smi"), "INSIDE")?;
+        std::fs::write(outside_dir.join("target.smi"), "SECRET_OUTSIDE")?;
+
+        let r_link = read_dir.join("sub");
+        let w_link = write_dir.join("sub");
+        std::fs::create_dir_all(&r_link)?;
+        std::fs::create_dir_all(&w_link)?;
+
+        let sb = PathSandbox::new(Some(&read_dir), Some(&write_dir))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_r = Arc::clone(&stop);
+        let stop_w = Arc::clone(&stop);
+
+        let racer = std::thread::spawn(move || {
+            let mut toggle = false;
+            while !stop_r.load(Ordering::Relaxed) {
+                toggle = !toggle;
+                let _ = std::fs::remove_file(&r_link);
+                let _ = std::fs::remove_dir_all(&r_link);
+                let _ = std::fs::remove_file(&w_link);
+                let _ = std::fs::remove_dir_all(&w_link);
+                if toggle {
+                    let _ = symlink(&outside_dir, &r_link);
+                    let _ = symlink(&outside_dir, &w_link);
+                } else {
+                    let _ = std::fs::create_dir(&r_link);
+                    let _ = std::fs::write(r_link.join("target.smi"), "INSIDE");
+                    let _ = std::fs::create_dir(&w_link);
+                }
+            }
+        });
+
+        for _ in 0..4_000 {
+            if let Ok((_, content)) = sb.read_to_string_limited(Path::new("sub/target.smi"), 1024) {
+                assert_ne!(
+                    content, "SECRET_OUTSIDE",
+                    "intermediate-dir symlink race leaked outside file!"
+                );
+            }
+            if let Ok((_, mut f)) = sb.open_write(Path::new("sub/pwned.csv")) {
+                use std::io::Write;
+                let _ = f.write_all(b"x");
+            }
+        }
+        stop_w.store(true, Ordering::Relaxed);
+        let _ = racer.join();
+
+        assert!(
+            !base.join("outside/pwned.csv").exists(),
+            "intermediate-dir symlink race wrote outside sandbox!"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 }
