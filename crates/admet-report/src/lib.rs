@@ -142,4 +142,24 @@ mod tests {
         assert!(pdf_text.contains("Mol_30"));
         Ok(())
     }
+
+    #[test]
+    fn csv_sanitizes_formula_injection_and_svg_strips_control_chars()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dangerous_name = "=CMD|' /C calc'!A0\x00\x1b<script>&\"";
+        let eval = evaluate_smiles("CCO", Some(dangerous_name))?;
+        let csv_out = export_csv_string(std::slice::from_ref(&eval))?;
+        assert!(
+            csv_out.contains("'=CMD|"),
+            "expected formula-injection prefix in CSV, got: {csv_out}"
+        );
+
+        let svg = render_boiled_egg_svg(&[eval]);
+        assert!(
+            !svg.chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\r')
+        );
+        assert!(svg.contains("&lt;script&gt;&amp;&quot;"));
+        Ok(())
+    }
 }

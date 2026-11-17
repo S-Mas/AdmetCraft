@@ -401,32 +401,45 @@ fn parse_bracket_atom(content: &str, pos: usize) -> Result<Atom, ChemError> {
         };
     }
 
-    // Optional formal charge (+, -, +2, -1, ++, --)
+    // Optional formal charge (+, -, +2, -1, ++, --), bounded strictly to [-15, +15]
     if idx < bytes.len() && (bytes[idx] == b'+' || bytes[idx] == b'-') {
-        let sign: i8 = if bytes[idx] == b'+' { 1 } else { -1 };
+        let sign: i16 = if bytes[idx] == b'+' { 1 } else { -1 };
         let ch_byte = bytes[idx];
         idx += 1;
-        if idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        let charge_i16 = if idx < bytes.len() && bytes[idx].is_ascii_digit() {
             let d_start = idx;
             while idx < bytes.len() && bytes[idx].is_ascii_digit() {
                 idx += 1;
             }
             let mag =
                 content[d_start..idx]
-                    .parse::<i8>()
+                    .parse::<i16>()
                     .map_err(|_| ChemError::InvalidSmiles {
                         pos,
                         msg: "invalid formal charge".to_string(),
                     })?;
-            atom.formal_charge = sign * mag;
+            sign * mag
         } else {
-            let mut count = 1i8;
+            let mut count: i16 = 1;
             while idx < bytes.len() && bytes[idx] == ch_byte {
-                count += 1;
+                count = count.saturating_add(1);
+                if count > 15 {
+                    return Err(ChemError::InvalidSmiles {
+                        pos,
+                        msg: "formal charge exceeds allowed [-15, +15] range".to_string(),
+                    });
+                }
                 idx += 1;
             }
-            atom.formal_charge = sign * count;
+            sign * count
+        };
+        if !(-15..=15).contains(&charge_i16) {
+            return Err(ChemError::InvalidSmiles {
+                pos,
+                msg: "formal charge exceeds allowed [-15, +15] range".to_string(),
+            });
         }
+        atom.formal_charge = charge_i16 as i8;
     }
 
     // Optional atom class `:N`

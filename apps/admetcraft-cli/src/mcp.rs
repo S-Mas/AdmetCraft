@@ -1,6 +1,9 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use admet_calc::{MoleculeEvaluation, evaluate_batch, evaluate_smiles};
 use admet_engine::{FilterCriteria, MAX_READ_BYTES, PathSandbox};
@@ -13,6 +16,10 @@ use serde_json::{Value, json};
 pub const MAX_MCP_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Maximum number of molecules accepted in a single MCP tool call.
 pub const MAX_MCP_MOLECULES: usize = 1_000;
+/// Maximum concurrent TCP client worker threads to avoid resource exhaustion.
+pub const MAX_TCP_CONNECTIONS: usize = 32;
+/// Read/write socket timeout in TCP mode so idle sockets never starve the server.
+pub const TCP_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -55,8 +62,20 @@ pub fn run_mcp_stdio(sandbox: &PathSandbox) -> Result<(), Box<dyn std::error::Er
     serve_stream(reader, &mut writer, sandbox, None)
 }
 
+struct ConnGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Run the MCP server over a TCP bridge address.
 /// Enforces loopback-only binding unless `allow_remote` is true, and requires `auth_token`.
+/// Spawns a bounded worker thread per connection with socket timeouts so idle clients cannot
+/// block other callers.
 pub fn run_mcp_tcp(
     addr_str: &str,
     sandbox: &PathSandbox,
@@ -77,18 +96,64 @@ pub fn run_mcp_tcp(
 
     let listener = TcpListener::bind(addr)?;
     eprintln!("AdmetCraft MCP TCP listening on {addr} (auth required)");
+    let active_conns = Arc::new(AtomicUsize::new(0));
+    let shared_sandbox = Arc::new(sandbox.clone());
+
     for stream_res in listener.incoming() {
         let Ok(stream) = stream_res else {
             continue;
         };
-        let Ok(reader_stream) = stream.try_clone() else {
-            continue;
-        };
-        let reader = BufReader::new(reader_stream);
-        let mut writer = stream;
-        let _ = serve_stream(reader, &mut writer, sandbox, Some(token.clone()));
+        handle_accepted_tcp_stream(
+            stream,
+            Arc::clone(&shared_sandbox),
+            token.clone(),
+            Arc::clone(&active_conns),
+            TCP_SOCKET_TIMEOUT,
+        );
     }
     Ok(())
+}
+
+fn handle_accepted_tcp_stream(
+    mut stream: TcpStream,
+    sandbox: Arc<PathSandbox>,
+    token: String,
+    active_conns: Arc<AtomicUsize>,
+    timeout: Duration,
+) {
+    let prev = active_conns.fetch_add(1, Ordering::AcqRel);
+    let guard = ConnGuard {
+        active: Arc::clone(&active_conns),
+    };
+    if prev >= MAX_TCP_CONNECTIONS {
+        let err_resp = JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: Value::Null,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32001,
+                message: "server busy: too many concurrent TCP connections".to_string(),
+            }),
+        };
+        let _ = write_json_line(&mut stream, &err_resp);
+        drop(guard);
+        return;
+    }
+
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let Ok(reader_stream) = stream.try_clone() else {
+        drop(guard);
+        return;
+    };
+
+    std::thread::spawn(move || {
+        let _guard = guard;
+        let reader = BufReader::new(reader_stream);
+        let mut writer = stream;
+        let _ = serve_stream(reader, &mut writer, &sandbox, Some(token));
+    });
 }
 
 #[cfg(test)]
@@ -99,6 +164,42 @@ pub fn serve_stream_for_test<R: BufRead, W: Write>(
     required_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     serve_stream(reader, writer, sandbox, required_token)
+}
+
+#[cfg(test)]
+pub fn handle_tcp_stream_for_test(
+    stream: TcpStream,
+    sandbox: Arc<PathSandbox>,
+    token: String,
+    active_conns: Arc<AtomicUsize>,
+    timeout: Duration,
+) {
+    handle_accepted_tcp_stream(stream, sandbox, token, active_conns, timeout);
+}
+
+#[cfg(test)]
+pub fn run_isolated_for_test<F>(id: Value, f: F) -> Option<String>
+where
+    F: FnOnce() -> String,
+{
+    let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(s) => JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(json!({ "ok": s })),
+            error: None,
+        },
+        Err(_) => JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32603,
+                message: "internal server error while handling MCP request".to_string(),
+            }),
+        },
+    };
+    serde_json::to_string(&resp).ok()
 }
 
 enum LineRead {
@@ -203,12 +304,41 @@ fn serve_stream<R: BufRead, W: Write>(
                     continue;
                 };
 
-                let resp = handle_request(id, &req.method, &req.params, sandbox, &mut auth);
+                let resp = execute_request_isolated(
+                    id.clone(),
+                    &req.method,
+                    &req.params,
+                    sandbox,
+                    &mut auth,
+                );
                 write_json_line(writer, &resp)?;
             }
         }
     }
     Ok(())
+}
+
+fn execute_request_isolated(
+    id: Value,
+    method: &str,
+    params: &Value,
+    sandbox: &PathSandbox,
+    auth: &mut SessionAuth,
+) -> JsonRpcResponse {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_request(id.clone(), method, params, sandbox, auth)
+    })) {
+        Ok(resp) => resp,
+        Err(_) => JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32603,
+                message: "internal server error while handling MCP request".to_string(),
+            }),
+        },
+    }
 }
 
 fn write_json_line<W: Write, T: Serialize>(

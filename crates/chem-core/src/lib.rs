@@ -269,4 +269,85 @@ $$$$
         assert_eq!(mol.formula(), "C9H8O4");
         Ok(())
     }
+
+    #[test]
+    fn desalt_preserves_mixtures_cocrystals_and_inorganic_salt_pairs() -> Result<(), ChemError> {
+        let benzene_dimer = parse_smiles("c1ccccc1.c1ccccc1")?;
+        assert_eq!(benzene_dimer.formula(), "C12H12");
+        assert!(
+            !benzene_dimer
+                .warnings
+                .iter()
+                .any(|w| w.contains("Desalted"))
+        );
+
+        let cocrystal = parse_smiles("CCO.CC(=O)O")?;
+        assert_eq!(cocrystal.formula(), "C4H10O3");
+        assert!(!cocrystal.warnings.iter().any(|w| w.contains("Desalted")));
+
+        let nacl = parse_smiles("[Na+].[Cl-]")?;
+        assert_eq!(nacl.formula(), "ClNa");
+        assert!(!nacl.warnings.iter().any(|w| w.contains("Desalted")));
+
+        let morphine_hcl_hydrate = parse_smiles("CN1CCC23c4c5ccc(O)c4OC2C(O)C=CC3C1C5.Cl.O")?;
+        assert_eq!(morphine_hcl_hydrate.formula(), "C17H19NO3");
+        assert!(
+            morphine_hcl_hydrate
+                .warnings
+                .iter()
+                .any(|w| w.contains("Desalted"))
+        );
+
+        let na_acetate = parse_smiles("CC(=O)[O-].[Na+]")?;
+        assert_eq!(na_acetate.formula(), "C2H3O2");
+        assert!(na_acetate.warnings.iter().any(|w| w.contains("Desalted")));
+        Ok(())
+    }
+
+    #[test]
+    fn formal_charge_overflow_and_bad_sdf_are_rejected_cleanly() {
+        let plus_128 = format!("[C{}]", "+".repeat(128));
+        assert!(matches!(
+            parse_smiles(&plus_128),
+            Err(ChemError::InvalidSmiles { .. })
+        ));
+        assert!(matches!(
+            parse_smiles("[C+20]"),
+            Err(ChemError::InvalidSmiles { .. })
+        ));
+
+        let bad_sdf_chg = "bad\n  test\n\n  1  0  0  0  0  0  0  0  0  0999 V2000\n    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\nM  CHG  1   0  -1\nM  END\n";
+        let res_zero = parse_sdf(bad_sdf_chg);
+        assert_eq!(res_zero.len(), 1);
+        assert!(matches!(&res_zero[0], Ok(m) if m.atoms[0].formal_charge == 0));
+
+        let bad_sdf_min = "bad\n  test\n\n  1  0  0  0  0  0  0  0  0  0999 V2000\n    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\nM  CHG  1 -2147483648 2147483647\nM  END\n";
+        let res_min = parse_sdf(bad_sdf_min);
+        assert_eq!(res_min.len(), 1);
+        assert!(res_min[0].is_ok());
+
+        let bad_sdf_giant = "bad\n  test\n\n999  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n";
+        assert!(matches!(
+            parse_sdf(bad_sdf_giant).first(),
+            Some(Err(ChemError::InvalidSdf { .. }))
+        ));
+    }
+
+    #[test]
+    fn k21_graph_reports_too_many_open_rings_error() -> Result<(), ChemError> {
+        let mut mol = Molecule::new();
+        for i in 0..21 {
+            mol.add_atom(Atom::new(i, "C")?);
+        }
+        for i in 0..21 {
+            for j in (i + 1)..21 {
+                mol.add_bond(i, j, BondOrder::Single, BondStereo::None)?;
+            }
+        }
+        assert!(matches!(
+            mol.try_to_canonical_smiles(),
+            Err(ChemError::TooManyOpenRings)
+        ));
+        Ok(())
+    }
 }

@@ -291,4 +291,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
+
+    #[test]
+    fn mcp_tcp_handles_concurrent_clients_despite_idle_socket_and_catches_panics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, atomic::AtomicUsize};
+        use std::time::Duration;
+
+        let base = std::env::temp_dir().join("admetcraft_mcp_tcp_concurrency_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+        let sb = Arc::new(PathSandbox::new(Some(&base), Some(&base))?);
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let active = Arc::new(AtomicUsize::new(0));
+        let sb_srv = Arc::clone(&sb);
+        let active_srv = Arc::clone(&active);
+
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((stream, _)) = listener.accept() {
+                    mcp::handle_tcp_stream_for_test(
+                        stream,
+                        Arc::clone(&sb_srv),
+                        "tok123".to_string(),
+                        Arc::clone(&active_srv),
+                        Duration::from_secs(2),
+                    );
+                }
+            }
+        });
+
+        // Client 1 stays idle without sending bytes
+        let _idle_client = TcpStream::connect(addr)?;
+
+        // Client 2 initializes and runs evaluate_smiles concurrently without waiting on Client 1
+        let mut active_client = TcpStream::connect(addr)?;
+        active_client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let init_req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"token":"tok123"}}).to_string() + "\n";
+        let eval_req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"evaluate_smiles","arguments":{"smiles":"CCO Ethanol"}}}).to_string() + "\n";
+        active_client.write_all(init_req.as_bytes())?;
+        active_client.write_all(eval_req.as_bytes())?;
+        active_client.flush()?;
+
+        let mut reader = BufReader::new(active_client);
+        let mut line1 = String::new();
+        let mut line2 = String::new();
+        reader.read_line(&mut line1)?;
+        reader.read_line(&mut line2)?;
+        let v1: serde_json::Value = serde_json::from_str(line1.trim())?;
+        let v2: serde_json::Value = serde_json::from_str(line2.trim())?;
+        assert_eq!(v1["id"], 1);
+        assert_eq!(v2["result"]["isError"], false);
+        assert_eq!(v2["result"]["structuredContent"]["count"], 1);
+
+        let _ = server_thread.join();
+
+        // Panic isolation check
+        #[allow(clippy::panic)]
+        let isolated = mcp::run_isolated_for_test(serde_json::json!(99), || {
+            panic!("simulated request panic");
+        })
+        .ok_or("missing serialized panic response")?;
+        let isolated_v: serde_json::Value = serde_json::from_str(&isolated)?;
+        assert_eq!(isolated_v["error"]["code"], -32603);
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
 }

@@ -1,5 +1,6 @@
 use crate::error::ChemError;
 use crate::mol::{Atom, BondOrder, BondStereo, Molecule};
+use crate::smiles::DEFAULT_MAX_ATOMS;
 
 /// Parse a single V2000 MOL block.
 pub fn parse_mol_block(block: &str, default_name: &str) -> Result<Molecule, ChemError> {
@@ -39,7 +40,27 @@ pub fn parse_mol_block(block: &str, default_name: &str) -> Result<Molecule, Chem
             msg: "invalid bond count".to_string(),
         })?;
 
-    if lines.len() < 4 + atom_count + bond_count {
+    if atom_count > DEFAULT_MAX_ATOMS {
+        return Err(ChemError::TooManyAtoms {
+            count: atom_count,
+            limit: DEFAULT_MAX_ATOMS,
+        });
+    }
+    if bond_count > 8_000 {
+        return Err(ChemError::InvalidSdf {
+            line: 4,
+            msg: "bond count exceeds maximum limit".to_string(),
+        });
+    }
+    let min_lines = 4usize
+        .checked_add(atom_count)
+        .and_then(|s| s.checked_add(bond_count))
+        .ok_or_else(|| ChemError::InvalidSdf {
+            line: 4,
+            msg: "atom/bond count overflow".to_string(),
+        })?;
+
+    if lines.len() < min_lines {
         return Err(ChemError::InvalidSdf {
             line: 4,
             msg: "truncated atom or bond block".to_string(),
@@ -63,8 +84,16 @@ pub fn parse_mol_block(block: &str, default_name: &str) -> Result<Molecule, Chem
                 msg: "atom line has fewer than 4 columns".to_string(),
             });
         }
-        let x: f64 = tokens[0].parse().unwrap_or(0.0);
-        let y: f64 = tokens[1].parse().unwrap_or(0.0);
+        let x: f64 = tokens[0]
+            .parse()
+            .ok()
+            .filter(|v: &f64| v.is_finite())
+            .unwrap_or(0.0);
+        let y: f64 = tokens[1]
+            .parse()
+            .ok()
+            .filter(|v: &f64| v.is_finite())
+            .unwrap_or(0.0);
         let symbol = tokens[3];
         let mut atom = Atom::new(idx, symbol)?;
         atom.coords_2d = Some([x, y]);
@@ -129,15 +158,15 @@ pub fn parse_mol_block(block: &str, default_name: &str) -> Result<Molecule, Chem
                 .split_whitespace()
                 .filter_map(|t| t.parse::<i32>().ok())
                 .collect();
-            if let Some(&count) = nums.first() {
-                for pair in nums[1..]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .take(count.max(0) as usize)
-                {
-                    let a_idx = (pair[0] - 1) as usize;
-                    if let Some(atom) = mol.atoms.get_mut(a_idx) {
+            if let Some(&count) = nums.first()
+                && count > 0
+            {
+                let safe_count = usize::try_from(count).unwrap_or(0).min(16);
+                for pair in nums[1..].as_chunks::<2>().0.iter().take(safe_count) {
+                    if let Some(one_based) = pair[0].checked_sub(1)
+                        && let Ok(a_idx) = usize::try_from(one_based)
+                        && let Some(atom) = mol.atoms.get_mut(a_idx)
+                    {
                         atom.formal_charge = pair[1].clamp(-15, 15) as i8;
                     }
                 }

@@ -26,4 +26,5 @@ package() {
   install -Dm644 "packaging/admetcraft.desktop" "$pkgdir/usr/share/applications/admetcraft.desktop"
   install -Dm644 "packaging/admetcraft.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/admetcraft.svg"
   install -Dm644 "LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 "LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
 }

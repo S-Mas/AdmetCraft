@@ -64,6 +64,10 @@ pub enum ChemError {
         limit: usize,
     },
 
+    /// Exceeded 99 simultaneous open ring closures while writing SMILES.
+    #[error("exceeded 99 simultaneous open ring closures in SMILES")]
+    TooManyOpenRings,
+
     /// Internal graph indexing error.
     #[error("molecular graph error: {0}")]
     Graph(String),

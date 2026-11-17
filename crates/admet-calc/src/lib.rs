@@ -27,7 +27,14 @@ pub enum AdmetError {
 /// Evaluate a parsed `Molecule` and produce the full ADMET profile.
 pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
     let name = mol.name.clone().unwrap_or_else(|| "Molecule 1".to_string());
-    let canonical_smiles = mol.to_canonical_smiles();
+    let mut warnings = mol.warnings.clone();
+    let canonical_smiles = match mol.try_to_canonical_smiles() {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(format!("Canonical SMILES omitted: {e}"));
+            String::new()
+        }
+    };
     let input_smiles = mol
         .input_smiles
         .clone()
@@ -48,7 +55,7 @@ pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
         name,
         input_smiles,
         canonical_smiles,
-        warnings: mol.warnings.clone(),
+        warnings,
         physicochemical,
         lipophilicity,
         water_solubility,

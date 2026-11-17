@@ -312,8 +312,10 @@ impl Molecule {
         Ok(())
     }
 
-    /// Strip counterions / smaller disconnected fragments (desalting), keeping the largest
-    /// fragment by heavy-atom count (breaking ties by mass) and recording a warning.
+    /// Strip recognized counterions, inorganic salts, and hydrates from multi-component
+    /// structures when at least one non-salt parent fragment remains.
+    /// Neutral mixtures and cocrystals (e.g. `c1ccccc1.c1ccccc1`, `CCO.CC(=O)O`) and
+    /// purely inorganic salt pairs (e.g. `[Na+].[Cl-]`) are preserved untouched.
     pub fn desalt(&mut self) {
         let n = self.atoms.len();
         if n <= 1 {
@@ -344,28 +346,21 @@ impl Molecule {
             return;
         }
 
-        // Select component with max (heavy_atoms, total_weight)
-        let mut best_idx = 0usize;
-        let mut best_score = (0usize, 0i64);
-        for (idx, comp) in comps.iter().enumerate() {
-            let heavy = comp
-                .iter()
-                .filter(|&&a| self.atoms[a].atomic_number != 1)
-                .count();
-            let mass_milli = (comp
-                .iter()
-                .map(|&a| self.atoms[a].atomic_weight())
-                .sum::<f64>()
-                * 1000.0) as i64;
-            if (heavy, mass_milli) > best_score {
-                best_score = (heavy, mass_milli);
-                best_idx = idx;
-            }
+        let is_salt: Vec<bool> = comps
+            .iter()
+            .map(|c| self.is_recognized_counterion(c))
+            .collect();
+
+        // Keep everything unless there is both at least one recognized counterion/salt
+        // and at least one non-salt parent fragment.
+        if !is_salt.iter().any(|&s| s) || !is_salt.iter().any(|&s| !s) {
+            return;
         }
 
         let mut stripped_labels = Vec::new();
+        let mut keep_set: BTreeSet<usize> = BTreeSet::new();
         for (idx, comp) in comps.iter().enumerate() {
-            if idx != best_idx {
+            if is_salt[idx] {
                 let syms: Vec<String> = comp
                     .iter()
                     .take(4)
@@ -377,10 +372,11 @@ impl Molecule {
                     syms.join("")
                 };
                 stripped_labels.push(label);
+            } else {
+                keep_set.extend(comp.iter().copied());
             }
         }
 
-        let keep_set: BTreeSet<usize> = comps[best_idx].iter().copied().collect();
         let mut new_idx_map: Vec<Option<usize>> = vec![None; n];
         let mut new_atoms = Vec::new();
         for (old_idx, mut atom) in self.atoms.drain(..).enumerate() {
@@ -409,10 +405,94 @@ impl Molecule {
         self.bonds = new_bonds;
         self.adj = new_adj;
         self.warnings.push(format!(
-            "Desalted: stripped {} counterion/fragment(s) ({}); kept largest fragment.",
+            "Desalted: stripped {} counterion/salt fragment(s) ({}); preserved parent structure.",
             stripped_labels.len(),
             stripped_labels.join(", ")
         ));
+    }
+
+    fn is_recognized_counterion(&self, comp: &[usize]) -> bool {
+        let heavy: Vec<usize> = comp
+            .iter()
+            .copied()
+            .filter(|&a| self.atoms[a].atomic_number != 1)
+            .collect();
+        if heavy.is_empty() {
+            // Standalone H+/H2/H- fragment in salt
+            return true;
+        }
+        if heavy.len() == 1 {
+            let a = &self.atoms[heavy[0]];
+            // Water hydrate (O, OH-, H3O+) or ammonia/ammonium (NH3, NH4+) or halide/HX or common metal counterions
+            return match a.atomic_number {
+                8 => a.formal_charge >= -1 && a.formal_charge <= 1, // O / [OH-] / [OH3+]
+                7 => a.formal_charge == 1,                          // [NH4+]
+                9 | 17 | 35 | 53 => true,                           // F, Cl, Br, I and HX
+                3 | 11 | 12 | 13 | 19 | 20 | 25 | 26 | 29 | 30 | 37 | 38 | 47 | 55 | 56 | 83 => {
+                    true
+                } // Li, Na, Mg, Al, K, Ca, Mn, Fe, Cu, Zn, Rb, Sr, Ag, Cs, Ba, Bi
+                _ => false,
+            };
+        }
+
+        let total_charge: i32 = comp
+            .iter()
+            .map(|&a| i32::from(self.atoms[a].formal_charge))
+            .sum();
+        let formula = self.component_formula(comp);
+        match formula.as_str() {
+            // Mineral acids / inorganic oxyanions & fluoroborate/fluorophosphate
+            "H2O4S" | "HO4S" | "O4S" => (-2..=0).contains(&total_charge),
+            "H3O4P" | "H2O4P" | "HO4P" | "O4P" => (-3..=0).contains(&total_charge),
+            "HNO3" | "NO3" => (-1..=0).contains(&total_charge),
+            "CH2O3" | "CHO3" | "CO3" => (-2..=0).contains(&total_charge),
+            "HClO4" | "ClO4" => (-1..=0).contains(&total_charge),
+            "BF4" | "F6P" => total_charge == -1,
+            // Common organic pharmaceutical counterions (excluding neutral acetic acid / acetate-Na+)
+            "C2HF3O2" | "C2F3O2" => (-1..=0).contains(&total_charge), // TFA
+            "CH4O3S" | "CH3O3S" => (-1..=0).contains(&total_charge),  // mesylate
+            "C7H8O3S" | "C7H7O3S" => (-1..=0).contains(&total_charge), // tosylate
+            "C6H6O3S" | "C6H5O3S" => (-1..=0).contains(&total_charge), // besylate
+            "CHO2" => total_charge == -1,                             // formate anion
+            "C2H2O4" | "C2HO4" | "C2O4" => (-2..=0).contains(&total_charge), // oxalate
+            "C4H4O4" | "C4H3O4" | "C4H2O4" => (-2..=0).contains(&total_charge), // maleate/fumarate
+            "C4H6O4" | "C4H5O4" => (-2..=0).contains(&total_charge),  // succinate
+            "C4H6O6" | "C4H5O6" | "C4H4O6" => (-2..=0).contains(&total_charge), // tartrate
+            "C6H8O7" | "C6H7O7" | "C6H6O7" | "C6H5O7" => (-3..=0).contains(&total_charge), // citrate
+            _ => false,
+        }
+    }
+
+    fn component_formula(&self, comp: &[usize]) -> String {
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+        for &idx in comp {
+            let a = &self.atoms[idx];
+            *counts.entry(a.symbol.clone()).or_default() += 1;
+            let h = u32::from(a.explicit_h) + u32::from(a.implicit_h);
+            if h > 0 && a.atomic_number != 1 {
+                *counts.entry("H".to_string()).or_default() += h;
+            }
+        }
+        let mut out = String::new();
+        if let Some(c) = counts.remove("C") {
+            out.push('C');
+            if c > 1 {
+                out.push_str(&c.to_string());
+            }
+            if let Some(h) = counts.remove("H") {
+                out.push('H');
+                if h > 1 {
+                    out.push_str(&h.to_string());
+                }
+            }
+        }
+        for (sym, cnt) in counts {
+            out.push_str(&sym);
+            if cnt > 1 {
+                out.push_str(&cnt.to_string());
+            }
+        }
+        out
     }
 
     /// Strip explicit hydrogen nodes (merging their count onto heavy parent `explicit_h`)
@@ -1033,9 +1113,17 @@ impl Molecule {
     }
 
     /// Deterministic canonical SMILES representation.
+    /// Returns an empty string if ring-closure serialization fails (>99 open rings);
+    /// use [`Self::try_to_canonical_smiles`] when fallibility should be reported.
     pub fn to_canonical_smiles(&self) -> String {
+        self.try_to_canonical_smiles().unwrap_or_default()
+    }
+
+    /// Deterministic canonical SMILES representation, failing if more than 99 rings
+    /// are simultaneously open during traversal.
+    pub fn try_to_canonical_smiles(&self) -> Result<String, ChemError> {
         if self.atoms.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
         let n = self.atoms.len();
         // Morgan-like symmetry invariant refinement
@@ -1097,10 +1185,10 @@ impl Molecule {
             if visited[start] {
                 continue;
             }
-            let s = self.serialize_component_smiles(start, &ranks, &mut visited);
+            let s = self.serialize_component_smiles(start, &ranks, &mut visited)?;
             component_smiles.push(s);
         }
-        component_smiles.join(".")
+        Ok(component_smiles.join("."))
     }
 
     fn serialize_component_smiles(
@@ -1108,7 +1196,7 @@ impl Molecule {
         start: usize,
         ranks: &[u64],
         visited: &mut [bool],
-    ) -> String {
+    ) -> Result<String, ChemError> {
         // 1. Iterative DFS spanning tree to identify ring-closure edges (stack-safe for 28k+ atoms)
         let mut tree_visited = vec![false; self.atoms.len()];
         let mut closure_bonds: Vec<usize> = Vec::new();
@@ -1237,7 +1325,7 @@ impl Molecule {
                     // Open new rings using lowest available ring number 1..=99
                     for (bid, border) in to_open {
                         let Some(num) = (1..=99u16).find(|&n| !used_nums[usize::from(n)]) else {
-                            continue;
+                            return Err(ChemError::TooManyOpenRings);
                         };
                         used_nums[usize::from(num)] = true;
                         active_bond_num.insert(bid, num);
@@ -1275,7 +1363,7 @@ impl Molecule {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     fn format_smiles_atom(&self, u: usize) -> String {
@@ -1319,8 +1407,9 @@ impl Molecule {
             }
         } else if a.formal_charge < 0 {
             s.push('-');
-            if a.formal_charge < -1 {
-                s.push_str(&(-a.formal_charge).to_string());
+            let mag = i16::from(a.formal_charge).abs();
+            if mag > 1 {
+                s.push_str(&mag.to_string());
             }
         }
         s.push(']');

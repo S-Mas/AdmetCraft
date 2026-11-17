@@ -253,10 +253,11 @@ pub fn draw_boiled_egg_interactive(
             Stroke::new(if is_sel { 2.0_f32 } else { 1.0_f32 }, Color32::BLACK),
         );
         if show_names {
+            let label = truncate_label(&e.name, 18);
             painter.text(
                 Pos2::new(p.x + 7.0, p.y - 6.0),
                 egui::Align2::LEFT_CENTER,
-                &e.name,
+                &label,
                 egui::FontId::proportional(10.0),
                 Color32::from_rgb(20, 20, 25),
             );
@@ -385,4 +386,14 @@ pub fn draw_boiled_egg_interactive(
     }
 
     clicked_idx
+}
+
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }

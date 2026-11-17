@@ -12,7 +12,9 @@ use admet_engine::{
     AdmetSession, Command, CommandRegistry, FilterCriteria, MAX_READ_BYTES, PathSandbox,
 };
 use admet_report::{ExportFormat, write_report_to_writer};
-use chem_core::{Molecule, ensure_2d_coords, parse_smiles};
+use chem_core::{
+    Molecule, ensure_2d_coords, parse_csv_batch, parse_sdf, parse_smiles, parse_smiles_batch,
+};
 use eframe::egui;
 use egui::{Color32, RichText, Sense, Vec2};
 
@@ -89,10 +91,23 @@ impl AdmetCraftApp {
     }
 
     fn run_command(&mut self, cmd: Command) {
+        let is_history_nav = matches!(cmd, Command::Undo | Command::Redo);
         match CommandRegistry::execute(&mut self.session, cmd) {
             Ok(out) => {
                 self.status_msg = out.message;
                 self.rebuild_mol_cache();
+                if is_history_nav {
+                    let selected_eval = self
+                        .session
+                        .selected_index
+                        .and_then(|idx| self.session.evaluations.get(idx))
+                        .or_else(|| self.session.evaluations.first());
+                    if let Some(ev) = selected_eval {
+                        let _ = self.sketcher.load_smiles(&ev.canonical_smiles);
+                    } else {
+                        self.sketcher.clear();
+                    }
+                }
             }
             Err(e) => self.status_msg = format!("Error: {e}"),
         }
@@ -175,10 +190,85 @@ impl AdmetCraftApp {
         self.run_command(cmd);
     }
 
+    fn import_dropped_files(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 {
+            self.import_file_path(&paths[0], true);
+            return;
+        }
+
+        let mut combined_lines = Vec::new();
+        let mut loaded_files = 0usize;
+        for path in paths {
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            let sandbox = match PathSandbox::new(Some(root), None) {
+                Ok(sb) => sb,
+                Err(e) => {
+                    self.status_msg = format!("Import root error: {e}");
+                    return;
+                }
+            };
+            let rel = path.file_name().map(Path::new).unwrap_or(path.as_path());
+            let (resolved, content) = match sandbox.read_to_string_limited(rel, MAX_READ_BYTES) {
+                Ok(res) => res,
+                Err(e) => {
+                    self.status_msg = format!("Sandbox import error ({}): {e}", path.display());
+                    return;
+                }
+            };
+            let ext = resolved
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let parsed_mols: Vec<Molecule> = if ext == "sdf" || ext == "mol" {
+                parse_sdf(&content)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .collect()
+            } else if ext == "csv" {
+                match parse_csv_batch(&content) {
+                    Ok(items) => items.into_iter().filter_map(Result::ok).collect(),
+                    Err(e) => {
+                        self.status_msg = format!("CSV parse error ({}): {e}", resolved.display());
+                        return;
+                    }
+                }
+            } else {
+                parse_smiles_batch(&content)
+                    .into_iter()
+                    .filter_map(|(_, _, r)| r.ok())
+                    .collect()
+            };
+
+            for (idx, mol) in parsed_mols.into_iter().enumerate() {
+                let Ok(smi) = mol.try_to_canonical_smiles() else {
+                    continue;
+                };
+                let name = mol
+                    .name
+                    .unwrap_or_else(|| format!("Mol_{}_{}", loaded_files + 1, idx + 1));
+                combined_lines.push(format!("{smi} {name}"));
+            }
+            loaded_files += 1;
+        }
+
+        let input = combined_lines.join("\n");
+        self.run_command(Command::EvaluateBatchText { input });
+        self.status_msg = format!(
+            "Imported {} molecule(s) from {} dropped files",
+            self.session.evaluations.len(),
+            loaded_files
+        );
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let wants_kb = ctx.wants_keyboard_input();
         let mut open_palette = false;
         let mut run_batch = false;
+        let mut load_examples = false;
         let mut do_undo = false;
         let mut do_redo = false;
         ctx.input(|i| {
@@ -187,6 +277,9 @@ impl AdmetCraftApp {
             }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::Enter) {
                 run_batch = true;
+            }
+            if !wants_kb && i.modifiers.ctrl && i.key_pressed(egui::Key::E) {
+                load_examples = true;
             }
             // Only intercept Ctrl+Z / Ctrl+Y for session undo when no TextEdit has focus
             if !wants_kb && i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
@@ -204,6 +297,9 @@ impl AdmetCraftApp {
             let input = self.session.smiles_input.clone();
             self.run_command(Command::EvaluateBatchText { input });
         }
+        if load_examples {
+            self.run_command(Command::LoadExampleBatch);
+        }
         if do_undo {
             self.run_command(Command::Undo);
         }
@@ -218,9 +314,7 @@ impl AdmetCraftApp {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        for p in dropped {
-            self.import_file_path(&p, true);
-        }
+        self.import_dropped_files(&dropped);
     }
 
     fn render_palette(&mut self, ctx: &egui::Context) {

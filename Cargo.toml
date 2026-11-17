@@ -32,3 +32,6 @@ csv = "1.3"
 libc = "0.2"
 eframe = "0.31"
 egui = "0.31"
+
+[profile.release]
+overflow-checks = true

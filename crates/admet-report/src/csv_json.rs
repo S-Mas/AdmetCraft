@@ -71,7 +71,7 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         let brenk_str = mc.brenk_alerts.join("; ");
         let warn_str = e.warnings.join("; ");
         wtr.write_record(&[
-            e.name.clone(),
+            sanitize_csv_cell(&e.name),
             e.canonical_smiles.clone(),
             p.formula.clone(),
             format!("{:.2}", p.molecular_weight),
@@ -117,12 +117,12 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
             d.muegge.violations.to_string(),
             format!("{:.2}", d.bioavailability_score),
             mc.pains_alerts.len().to_string(),
-            pains_str,
+            sanitize_csv_cell(&pains_str),
             mc.brenk_alerts.len().to_string(),
-            brenk_str,
+            sanitize_csv_cell(&brenk_str),
             mc.leadlikeness.violations.to_string(),
             format!("{:.2}", mc.synthetic_accessibility),
-            warn_str,
+            sanitize_csv_cell(&warn_str),
         ])?;
     }
 
@@ -130,6 +130,16 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         .into_inner()
         .map_err(|e| ReportError::Format(e.to_string()))?;
     String::from_utf8(bytes).map_err(|e| ReportError::Format(e.to_string()))
+}
+
+/// Prevent spreadsheet formula injection (`=`, `+`, `-`, `@`, `\t`, `\r`) in free-text CSV cells.
+fn sanitize_csv_cell(val: &str) -> String {
+    let trimmed = val.trim_start_matches(' ');
+    if trimmed.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{val}")
+    } else {
+        val.to_string()
+    }
 }
 
 /// Export evaluations to pretty-printed JSON.
