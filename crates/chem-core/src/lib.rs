@@ -17,7 +17,7 @@ pub use layout::{ensure_2d_coords, generate_2d_coords};
 pub use mol::{Atom, Bond, BondOrder, BondStereo, ChiralTag, Hybridization, Molecule};
 pub use sdf::{parse_mol_block, parse_sdf};
 pub use smarts::SmartsPattern;
-pub use smiles::{parse_smiles, parse_smiles_line};
+pub use smiles::{DEFAULT_MAX_ATOMS, parse_smiles, parse_smiles_line, parse_smiles_with_limit};
 
 /// Parse batch lines of `SMILES [Name]` (skipping blank lines and `#` comments).
 pub fn parse_smiles_batch(input: &str) -> Vec<(usize, String, Result<Molecule, ChemError>)> {
@@ -36,31 +36,49 @@ pub fn parse_smiles_batch(input: &str) -> Vec<(usize, String, Result<Molecule, C
         .collect()
 }
 
-/// Parse CSV batch text (`smiles` column + optional `name`/`id` column).
+/// Parse CSV batch text (`smiles`/`Canonical SMILES` column + optional `name`/`Molecule`/`id` column).
+/// Properly handles RFC-4180 quoted fields containing commas.
 pub fn parse_csv_batch(input: &str) -> Result<Vec<Result<Molecule, ChemError>>, ChemError> {
-    let mut lines = input.lines().filter(|l| !l.trim().is_empty());
-    let Some(header) = lines.next() else {
+    if input.trim().is_empty() {
         return Err(ChemError::EmptyInput);
-    };
-    let cols: Vec<&str> = header.split(',').map(|s| s.trim().trim_matches('"')).collect();
-    let smi_col = cols
+    }
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(input.as_bytes());
+    let headers = rdr
+        .headers()
+        .map_err(|e| ChemError::Graph(format!("CSV header error: {e}")))?
+        .clone();
+
+    let smi_col = headers
         .iter()
-        .position(|c| c.eq_ignore_ascii_case("smiles") || c.eq_ignore_ascii_case("canonical_smiles") || c.eq_ignore_ascii_case("smi"))
+        .position(|c| {
+            let norm = c.trim().to_ascii_lowercase().replace(' ', "_");
+            matches!(norm.as_str(), "smiles" | "canonical_smiles" | "smi")
+        })
         .unwrap_or(0);
-    let name_col = cols
-        .iter()
-        .position(|c| c.eq_ignore_ascii_case("name") || c.eq_ignore_ascii_case("molecule") || c.eq_ignore_ascii_case("id"));
+    let name_col = headers.iter().position(|c| {
+        let norm = c.trim().to_ascii_lowercase().replace(' ', "_");
+        matches!(norm.as_str(), "name" | "molecule" | "molecule_name" | "id")
+    });
 
     let mut out = Vec::new();
-    for (idx, line) in lines.enumerate() {
-        let fields: Vec<&str> = line.split(',').map(|s| s.trim().trim_matches('"')).collect();
-        let Some(smi) = fields.get(smi_col) else {
+    for (idx, rec_res) in rdr.records().enumerate() {
+        let rec = match rec_res {
+            Ok(r) => r,
+            Err(e) => {
+                out.push(Err(ChemError::Graph(format!("CSV row {}: {e}", idx + 2))));
+                continue;
+            }
+        };
+        let Some(smi) = rec.get(smi_col).map(str::trim).filter(|s| !s.is_empty()) else {
             continue;
         };
         let default_name = format!("Molecule {}", idx + 1);
         let name = name_col
-            .and_then(|c| fields.get(c))
-            .map(|s| s.trim())
+            .and_then(|c| rec.get(c))
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(&default_name);
         let res = parse_smiles(smi).map(|mut m| {
@@ -138,10 +156,13 @@ $$$$
 
     #[test]
     fn layout_generates_finite_2d_coords() -> Result<(), ChemError> {
-        let mut sildenafil = parse_smiles("CCCc1nn(C)c2c(=O)[nH]c(-c3cc(S(=O)(=O)N4CCN(C)CC4)ccc3OCC)nc12")?;
+        let mut sildenafil =
+            parse_smiles("CCCc1nn(C)c2c(=O)[nH]c(-c3cc(S(=O)(=O)N4CCN(C)CC4)ccc3OCC)nc12")?;
         generate_2d_coords(&mut sildenafil);
         for a in &sildenafil.atoms {
-            let xy = a.coords_2d.ok_or_else(|| ChemError::Graph("missing 2d coords".to_string()))?;
+            let xy = a
+                .coords_2d
+                .ok_or_else(|| ChemError::Graph("missing 2d coords".to_string()))?;
             assert!(xy[0].is_finite() && xy[1].is_finite());
         }
 
@@ -152,12 +173,100 @@ $$$$
                 if aspirin.bond_between(i, j).is_some() {
                     continue;
                 }
-                let ci = aspirin.atoms[i].coords_2d.ok_or_else(|| ChemError::Graph("missing".to_string()))?;
-                let cj = aspirin.atoms[j].coords_2d.ok_or_else(|| ChemError::Graph("missing".to_string()))?;
+                let ci = aspirin.atoms[i]
+                    .coords_2d
+                    .ok_or_else(|| ChemError::Graph("missing".to_string()))?;
+                let cj = aspirin.atoms[j]
+                    .coords_2d
+                    .ok_or_else(|| ChemError::Graph("missing".to_string()))?;
                 let d = ((ci[0] - cj[0]).powi(2) + (ci[1] - cj[1]).powi(2)).sqrt();
                 assert!(d > 1.0, "aspirin atoms {i} and {j} overlap (d={d:.2})");
             }
         }
+
+        // Norbornane bridged bicyclic: no elongated > 2.3 bond lengths
+        let mut norbornane = parse_smiles("C1CC2CCC1C2")?;
+        generate_2d_coords(&mut norbornane);
+        for b in &norbornane.bonds {
+            let cu = norbornane.atoms[b.u]
+                .coords_2d
+                .ok_or_else(|| ChemError::Graph("missing".to_string()))?;
+            let cv = norbornane.atoms[b.v]
+                .coords_2d
+                .ok_or_else(|| ChemError::Graph("missing".to_string()))?;
+            let len = ((cu[0] - cv[0]).powi(2) + (cu[1] - cv[1]).powi(2)).sqrt();
+            assert!(
+                len < 2.3,
+                "norbornane bond {}-{} too long ({len:.2})",
+                b.u,
+                b.v
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn desalt_strips_counterion_and_warns() -> Result<(), ChemError> {
+        let sodium_acetate = parse_smiles("CC(=O)[O-].[Na+]")?;
+        assert_eq!(sodium_acetate.formula(), "C2H3O2");
+        assert!(
+            sodium_acetate
+                .warnings
+                .iter()
+                .any(|w| w.contains("Desalted"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stereochemistry_emits_warning() -> Result<(), ChemError> {
+        let l_ala = parse_smiles("C[C@@H](C(=O)O)N")?;
+        assert!(l_ala.warnings.iter().any(|w| w.contains("Stereochemistry")));
+        let trans_butene = parse_smiles("C/C=C/C")?;
+        assert!(
+            trans_butene
+                .warnings
+                .iter()
+                .any(|w| w.contains("Stereochemistry"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn huge_chain_uses_iterative_dfs_and_limit_protects() -> Result<(), ChemError> {
+        let giant = "C".repeat(28_000);
+        let err = parse_smiles(&giant);
+        assert!(matches!(err, Err(ChemError::TooManyAtoms { .. })));
+
+        // Iterative DFS handles 3,000-atom chain without stack overflow
+        let long_chain = "C".repeat(3_000);
+        let mol = parse_smiles_with_limit(&long_chain, 4_000)?;
+        let can = mol.to_canonical_smiles();
+        assert_eq!(can.len(), 3_000);
+        Ok(())
+    }
+
+    #[test]
+    fn polycycle_over_100_rings_reuses_ring_numbers_and_reparses() -> Result<(), ChemError> {
+        // Build a linear chain of 105 spiro/linked cyclopropyl rings (105 ring closures!)
+        let smi = format!("C1CC1{}", "C2CC2".repeat(104));
+        let mol = parse_smiles(&smi)?;
+        assert_eq!(mol.rings.len(), 105);
+        let can = mol.to_canonical_smiles();
+        let reparsed = parse_smiles(&can)?;
+        assert_eq!(reparsed.atoms.len(), mol.atoms.len());
+        assert_eq!(reparsed.rings.len(), 105);
+        Ok(())
+    }
+
+    #[test]
+    fn csv_batch_handles_canonical_smiles_and_quoted_commas() -> Result<(), ChemError> {
+        let csv_in = "Molecule,Canonical SMILES,MW\n\"Aspirin, acetylsalicylic\",CC(=O)Oc1ccccc1C(=O)O,180.16\n";
+        let res = parse_csv_batch(csv_in)?;
+        assert_eq!(res.len(), 1);
+        let mol = res.into_iter().next().ok_or(ChemError::EmptyInput)??;
+        assert_eq!(mol.name.as_deref(), Some("Aspirin, acetylsalicylic"));
+        assert_eq!(mol.formula(), "C9H8O4");
         Ok(())
     }
 }

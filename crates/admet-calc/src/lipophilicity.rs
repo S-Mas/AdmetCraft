@@ -3,21 +3,23 @@ use chem_core::{BondOrder, Hybridization, Molecule};
 use crate::physicochem::{compute_tpsa_ertl, round2};
 use crate::types::Lipophilicity;
 
-/// Compute all 5 Log Po/w models and their arithmetic mean (Consensus Log Po/w).
+/// Compute lipophilicity models (`WLOGP`, `XLOGP3`-heuristic, `MLOGP`), their 3-model
+/// `consensus_log_p`, plus two experimental linear surrogates (`solvation_logp_est`,
+/// `topological_logp_est`).
 pub fn compute_lipophilicity(mol: &Molecule) -> Lipophilicity {
     let (wlogp, _mr) = compute_wlogp_and_mr(mol);
     let mlogp = compute_mlogp(mol);
     let xlogp3 = compute_xlogp3(mol);
-    let ilogp = compute_ilogp(mol, xlogp3, wlogp);
-    let silicos_it = compute_silicos_logp(mol, xlogp3, wlogp);
-    let consensus = (ilogp + xlogp3 + wlogp + mlogp + silicos_it) / 5.0;
+    let solvation_logp_est = compute_solvation_logp_est(mol, xlogp3, wlogp);
+    let topological_logp_est = compute_topological_logp_est(mol, xlogp3, wlogp);
+    let consensus = (xlogp3 + wlogp + mlogp) / 3.0;
 
     Lipophilicity {
-        ilogp: round2(ilogp),
-        xlogp3: round2(xlogp3),
         wlogp: round2(wlogp),
+        xlogp3: round2(xlogp3),
         mlogp: round2(mlogp),
-        silicos_it: round2(silicos_it),
+        solvation_logp_est: round2(solvation_logp_est),
+        topological_logp_est: round2(topological_logp_est),
         consensus_log_p: round2(consensus),
     }
 }
@@ -84,7 +86,8 @@ fn crippen_attached_h_contrib(mol: &Molecule, parent_idx: usize) -> (f64, f64) {
     let p = &mol.atoms[parent_idx];
     match p.atomic_number {
         6 => {
-            if is_carbonyl_or_hetero_multi(mol, parent_idx) || p.hybridization == Hybridization::Sp {
+            if is_carbonyl_or_hetero_multi(mol, parent_idx) || p.hybridization == Hybridization::Sp
+            {
                 (0.2667, 1.313) // H4: attached to sp C or C=X
             } else {
                 (0.1230, 1.057) // H1: aliphatic or aromatic C-H
@@ -239,9 +242,7 @@ fn crippen_heavy_contrib(mol: &Molecule, idx: usize) -> (f64, f64) {
                                 && mol.atoms[o2].atomic_number == 8
                         })
                 });
-                let is_aromatic_adj = mol
-                    .neighbors(idx)
-                    .any(|nbr| mol.atoms[nbr].aromatic);
+                let is_aromatic_adj = mol.neighbors(idx).any(|nbr| mol.atoms[nbr].aromatic);
                 if is_amide {
                     if a.total_h() >= 1 {
                         (-0.5060, 2.400) // amide NH
@@ -443,19 +444,17 @@ pub fn compute_mlogp(mol: &Molecule) -> f64 {
     // QN, NCS, BLM
     let qn = if has_qn { 1.0 } else { 0.0 };
     let ncs = 0.0;
-    let blm = if mol.rings.iter().any(|r| {
-        r.len() == 4
-            && r.iter().any(|&a| mol.atoms[a].atomic_number == 7)
-    }) {
+    let blm = if mol
+        .rings
+        .iter()
+        .any(|r| r.len() == 4 && r.iter().any(|&a| mol.atoms[a].atomic_number == 7))
+    {
         1.0
     } else {
         0.0
     };
 
-    1.244 * cx.powf(0.6)
-        - 1.017 * no.powf(0.9)
-        + 0.406 * prx
-        - 0.145 * ub.powf(0.8)
+    1.244 * cx.powf(0.6) - 1.017 * no.powf(0.9) + 0.406 * prx - 0.145 * ub.powf(0.8)
         + 0.511 * hb
         + 0.268 * pol
         - 2.215 * amp
@@ -596,7 +595,10 @@ pub fn compute_xlogp3(mol: &Molecule) -> f64 {
             8 => {
                 if a.aromatic {
                     val -= 0.10; // furan
-                } else if mol.adj[idx].iter().any(|&(_, b)| mol.bonds[b].order == BondOrder::Double) {
+                } else if mol.adj[idx]
+                    .iter()
+                    .any(|&(_, b)| mol.bonds[b].order == BondOrder::Double)
+                {
                     val -= 0.399; // =O
                 } else if a.total_h() > 0 {
                     let on_acid = mol.neighbors(idx).any(|c| {
@@ -626,7 +628,10 @@ pub fn compute_xlogp3(mol: &Molecule) -> f64 {
             16 => {
                 if a.aromatic {
                     val += 0.55;
-                } else if mol.adj[idx].iter().any(|&(_, b)| mol.bonds[b].order == BondOrder::Double) {
+                } else if mol.adj[idx]
+                    .iter()
+                    .any(|&(_, b)| mol.bonds[b].order == BondOrder::Double)
+                {
                     val -= 0.95; // sulfoxide/sulfone S
                 } else {
                     val += 0.42; // thioether
@@ -649,21 +654,19 @@ pub fn compute_xlogp3(mol: &Molecule) -> f64 {
     val
 }
 
-/// Daina, Michielin & Zoete (2014) *J. Chem. Inf. Model.* iLOGP physics-inspired model.
-fn compute_ilogp(mol: &Molecule, xlogp3: f64, wlogp: f64) -> f64 {
+/// Experimental solvation-inspired linear logP surrogate (NOT SwissADME iLOGP).
+fn compute_solvation_logp_est(mol: &Molecule, xlogp3: f64, wlogp: f64) -> f64 {
     let tpsa = compute_tpsa_ertl(mol);
     let heavy = mol.heavy_atom_count() as f64;
     let arom = mol.aromatic_heavy_atom_count() as f64;
-    // Calibrated physics-based solvation surrogate combining nonpolar surface (heavy, arom)
-    // and polar GB/SA desolvation (TPSA) with atomistic baseline
     let nonpolar_term = 0.145 * heavy + 0.055 * arom;
     let polar_desolv = 0.021 * tpsa;
     let phys_est = nonpolar_term - polar_desolv + 0.18;
     0.50 * phys_est + 0.25 * xlogp3 + 0.25 * wlogp
 }
 
-/// SILICOS-IT topological LogP model.
-fn compute_silicos_logp(mol: &Molecule, xlogp3: f64, wlogp: f64) -> f64 {
+/// Experimental topological linear logP surrogate (NOT Silicos-IT).
+fn compute_topological_logp_est(mol: &Molecule, xlogp3: f64, wlogp: f64) -> f64 {
     let tpsa = compute_tpsa_ertl(mol);
     let heavy = mol.heavy_atom_count() as f64;
     let n_hetero = mol

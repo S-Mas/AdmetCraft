@@ -4,9 +4,16 @@ use crate::element::element_by_symbol;
 use crate::error::ChemError;
 use crate::mol::{Atom, BondOrder, BondStereo, ChiralTag, Molecule};
 
-/// Parse a SMILES string (optionally followed by whitespace and molecule name in batch helpers,
-/// though `parse_smiles` expects just the SMILES token).
+/// Default upper bound on atoms accepted from a single SMILES input (DoS protection).
+pub const DEFAULT_MAX_ATOMS: usize = 2_000;
+
+/// Parse a SMILES string (enforcing `DEFAULT_MAX_ATOMS`).
 pub fn parse_smiles(input: &str) -> Result<Molecule, ChemError> {
+    parse_smiles_with_limit(input, DEFAULT_MAX_ATOMS)
+}
+
+/// Parse a SMILES string with an explicit maximum atom limit.
+pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<Molecule, ChemError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(ChemError::EmptyInput);
@@ -21,6 +28,7 @@ pub fn parse_smiles(input: &str) -> Result<Molecule, ChemError> {
     let mut current: Option<usize> = None;
     let mut pending_bond: Option<BondOrder> = None;
     let mut pending_stereo = BondStereo::None;
+    let mut saw_chiral_or_ez = false;
     let mut ring_opens: HashMap<u16, (usize, Option<BondOrder>, BondStereo)> = HashMap::new();
 
     while i < bytes.len() {
@@ -60,6 +68,7 @@ pub fn parse_smiles(input: &str) -> Result<Molecule, ChemError> {
             }
             '/' => {
                 pending_stereo = BondStereo::Up;
+                saw_chiral_or_ez = true;
                 if pending_bond.is_none() {
                     pending_bond = Some(BondOrder::Single);
                 }
@@ -67,6 +76,7 @@ pub fn parse_smiles(input: &str) -> Result<Molecule, ChemError> {
             }
             '\\' => {
                 pending_stereo = BondStereo::Down;
+                saw_chiral_or_ez = true;
                 if pending_bond.is_none() {
                     pending_bond = Some(BondOrder::Single);
                 }
@@ -119,15 +129,23 @@ pub fn parse_smiles(input: &str) -> Result<Molecule, ChemError> {
                 i += 1;
             }
             '[' => {
-                let close = trimmed[i..]
-                    .find(']')
-                    .map(|off| i + off)
-                    .ok_or_else(|| ChemError::InvalidSmiles {
+                let close = trimmed[i..].find(']').map(|off| i + off).ok_or_else(|| {
+                    ChemError::InvalidSmiles {
                         pos: i,
                         msg: "unclosed '[' bracket atom".to_string(),
-                    })?;
+                    }
+                })?;
                 let content = &trimmed[(i + 1)..close];
                 let atom = parse_bracket_atom(content, i)?;
+                if atom.chiral != ChiralTag::None {
+                    saw_chiral_or_ez = true;
+                }
+                if mol.atoms.len() >= max_atoms {
+                    return Err(ChemError::TooManyAtoms {
+                        count: mol.atoms.len() + 1,
+                        limit: max_atoms,
+                    });
+                }
                 let new_id = mol.add_atom(atom);
                 if let Some(prev) = current {
                     let order = resolve_bond_order(&mol, prev, new_id, pending_bond.take());
@@ -141,6 +159,12 @@ pub fn parse_smiles(input: &str) -> Result<Molecule, ChemError> {
             }
             _ => {
                 let (atom, consumed) = parse_organic_atom(trimmed, i)?;
+                if mol.atoms.len() >= max_atoms {
+                    return Err(ChemError::TooManyAtoms {
+                        count: mol.atoms.len() + 1,
+                        limit: max_atoms,
+                    });
+                }
                 let new_id = mol.add_atom(atom);
                 if let Some(prev) = current {
                     let order = resolve_bond_order(&mol, prev, new_id, pending_bond.take());
@@ -165,7 +189,15 @@ pub fn parse_smiles(input: &str) -> Result<Molecule, ChemError> {
         return Err(ChemError::EmptyInput);
     }
 
+    if saw_chiral_or_ez {
+        mol.warnings.push(
+            "Stereochemistry markers (@/@@ or /\\) present in input; 3D/stereo descriptors are not modeled and canonical SMILES omits stereo."
+                .to_string(),
+        );
+    }
+
     mol.suppress_explicit_hydrogens();
+    mol.desalt();
     mol.perceive()?;
     Ok(mol)
 }
@@ -309,7 +341,10 @@ fn parse_bracket_atom(content: &str, pos: usize) -> Result<Atom, ChemError> {
         });
     }
     let aromatic = c0.is_ascii_lowercase();
-    let sym_end = if idx + 1 < bytes.len() && (bytes[idx + 1] as char).is_ascii_lowercase() && bytes[idx + 1] != b'h' {
+    let sym_end = if idx + 1 < bytes.len()
+        && (bytes[idx + 1] as char).is_ascii_lowercase()
+        && bytes[idx + 1] != b'h'
+    {
         let two = format!("{}{}", c0.to_ascii_uppercase(), bytes[idx + 1] as char);
         if element_by_symbol(&two).is_some() {
             idx + 2
@@ -376,12 +411,13 @@ fn parse_bracket_atom(content: &str, pos: usize) -> Result<Atom, ChemError> {
             while idx < bytes.len() && bytes[idx].is_ascii_digit() {
                 idx += 1;
             }
-            let mag = content[d_start..idx]
-                .parse::<i8>()
-                .map_err(|_| ChemError::InvalidSmiles {
-                    pos,
-                    msg: "invalid formal charge".to_string(),
-                })?;
+            let mag =
+                content[d_start..idx]
+                    .parse::<i8>()
+                    .map_err(|_| ChemError::InvalidSmiles {
+                        pos,
+                        msg: "invalid formal charge".to_string(),
+                    })?;
             atom.formal_charge = sign * mag;
         } else {
             let mut count = 1i8;

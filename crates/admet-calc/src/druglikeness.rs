@@ -27,7 +27,11 @@ pub fn compute_druglikeness(
     }
 }
 
-fn eval_lipinski(mol: &Molecule, phys: &PhysicochemicalProperties, lipo: &Lipophilicity) -> RuleResult {
+fn eval_lipinski(
+    mol: &Molecule,
+    phys: &PhysicochemicalProperties,
+    lipo: &Lipophilicity,
+) -> RuleResult {
     let n_or_o = count_n_or_o(mol);
     let nh_or_oh = count_nh_or_oh(mol);
     let mut details = Vec::new();
@@ -51,7 +55,11 @@ fn eval_lipinski(mol: &Molecule, phys: &PhysicochemicalProperties, lipo: &Lipoph
     }
 }
 
-fn eval_ghose(mol: &Molecule, phys: &PhysicochemicalProperties, lipo: &Lipophilicity) -> RuleResult {
+fn eval_ghose(
+    mol: &Molecule,
+    phys: &PhysicochemicalProperties,
+    lipo: &Lipophilicity,
+) -> RuleResult {
     let total_atoms = mol.atoms.len()
         + mol
             .atoms
@@ -60,13 +68,19 @@ fn eval_ghose(mol: &Molecule, phys: &PhysicochemicalProperties, lipo: &Lipophili
             .sum::<usize>();
     let mut details = Vec::new();
     if phys.molecular_weight < 160.0 || phys.molecular_weight > 480.0 {
-        details.push(format!("MW outside [160, 480] ({:.2})", phys.molecular_weight));
+        details.push(format!(
+            "MW outside [160, 480] ({:.2})",
+            phys.molecular_weight
+        ));
     }
     if lipo.wlogp < -0.4 || lipo.wlogp > 5.6 {
         details.push(format!("WLOGP outside [-0.4, 5.6] ({:.2})", lipo.wlogp));
     }
     if phys.molar_refractivity < 40.0 || phys.molar_refractivity > 130.0 {
-        details.push(format!("MR outside [40, 130] ({:.2})", phys.molar_refractivity));
+        details.push(format!(
+            "MR outside [40, 130] ({:.2})",
+            phys.molar_refractivity
+        ));
     }
     if !(20..=70).contains(&total_atoms) {
         details.push(format!("#atoms outside [20, 70] ({total_atoms})"));
@@ -111,7 +125,11 @@ fn eval_egan(phys: &PhysicochemicalProperties, lipo: &Lipophilicity) -> RuleResu
     }
 }
 
-fn eval_muegge(mol: &Molecule, phys: &PhysicochemicalProperties, lipo: &Lipophilicity) -> RuleResult {
+fn eval_muegge(
+    mol: &Molecule,
+    phys: &PhysicochemicalProperties,
+    lipo: &Lipophilicity,
+) -> RuleResult {
     let num_carbons = mol.atoms.iter().filter(|a| a.atomic_number == 6).count();
     let num_hetero = mol
         .atoms
@@ -121,7 +139,10 @@ fn eval_muegge(mol: &Molecule, phys: &PhysicochemicalProperties, lipo: &Lipophil
     let num_rings = mol.rings.len();
     let mut details = Vec::new();
     if phys.molecular_weight < 200.0 || phys.molecular_weight > 600.0 {
-        details.push(format!("MW outside [200, 600] ({:.2})", phys.molecular_weight));
+        details.push(format!(
+            "MW outside [200, 600] ({:.2})",
+            phys.molecular_weight
+        ));
     }
     if lipo.xlogp3 < -2.0 || lipo.xlogp3 > 5.0 {
         details.push(format!("XLOGP3 outside [-2, 5] ({:.2})", lipo.xlogp3));
@@ -139,7 +160,10 @@ fn eval_muegge(mol: &Molecule, phys: &PhysicochemicalProperties, lipo: &Lipophil
         details.push(format!("Num. heteroatoms<=1 ({num_hetero})"));
     }
     if phys.rotatable_bonds > 15 {
-        details.push(format!("Num. rotatable bonds>15 ({})", phys.rotatable_bonds));
+        details.push(format!(
+            "Num. rotatable bonds>15 ({})",
+            phys.rotatable_bonds
+        ));
     }
     if phys.h_bond_acceptors > 10 {
         details.push(format!("HBA>10 ({})", phys.h_bond_acceptors));

@@ -134,6 +134,7 @@ dependencies = [
  "admet-calc",
  "admet-report",
  "chem-core",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -717,6 +718,7 @@ dependencies = [
 name = "chem-core"
 version = "0.1.0"
 dependencies = [
+ "csv",
  "serde",
  "thiserror 2.0.21",
 ]

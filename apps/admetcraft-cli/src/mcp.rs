@@ -1,13 +1,18 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 
 use admet_calc::{MoleculeEvaluation, evaluate_batch, evaluate_smiles};
-use admet_engine::{FilterCriteria, PathSandbox};
-use admet_report::{ExportFormat, write_report_file};
+use admet_engine::{FilterCriteria, MAX_READ_BYTES, PathSandbox};
+use admet_report::{ExportFormat, write_report_to_writer};
 use chem_core::{parse_csv_batch, parse_sdf, parse_smiles, parse_smiles_batch};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// Maximum incoming JSON-RPC request line size (1 MiB) to prevent memory amplification DoS.
+pub const MAX_MCP_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Maximum number of molecules accepted in a single MCP tool call.
+pub const MAX_MCP_MOLECULES: usize = 1_000;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -35,18 +40,43 @@ struct JsonRpcError {
     message: String,
 }
 
-/// Run the MCP server over `stdin`/`stdout`.
+struct SessionAuth {
+    initialized: bool,
+    required_token: Option<String>,
+}
+
+/// Run the MCP server over `stdin`/`stdout` (no token required for local stdio pipe,
+/// though `initialize` lifecycle is still enforced).
 pub fn run_mcp_stdio(sandbox: &PathSandbox) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
-    serve_stream(reader, &mut writer, sandbox)
+    serve_stream(reader, &mut writer, sandbox, None)
 }
 
-/// Run the MCP server over a TCP bridge address (e.g. `127.0.0.1:7878`).
-pub fn run_mcp_tcp(addr: &str, sandbox: &PathSandbox) -> Result<(), Box<dyn std::error::Error>> {
+/// Run the MCP server over a TCP bridge address.
+/// Enforces loopback-only binding unless `allow_remote` is true, and requires `auth_token`.
+pub fn run_mcp_tcp(
+    addr_str: &str,
+    sandbox: &PathSandbox,
+    allow_remote: bool,
+    auth_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = addr_str.parse()?;
+    if !addr.ip().is_loopback() && !allow_remote {
+        return Err(format!(
+            "refusing to bind non-loopback TCP address {addr} without --allow-remote"
+        )
+        .into());
+    }
+    let token = auth_token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or("TCP MCP mode requires a non-empty --mcp-token (or ADMETCRAFT_MCP_TOKEN)")?;
+
     let listener = TcpListener::bind(addr)?;
+    eprintln!("AdmetCraft MCP TCP listening on {addr} (auth required)");
     for stream_res in listener.incoming() {
         let Ok(stream) = stream_res else {
             continue;
@@ -56,7 +86,7 @@ pub fn run_mcp_tcp(addr: &str, sandbox: &PathSandbox) -> Result<(), Box<dyn std:
         };
         let reader = BufReader::new(reader_stream);
         let mut writer = stream;
-        let _ = serve_stream(reader, &mut writer, sandbox);
+        let _ = serve_stream(reader, &mut writer, sandbox, Some(token.clone()));
     }
     Ok(())
 }
@@ -66,45 +96,117 @@ pub fn serve_stream_for_test<R: BufRead, W: Write>(
     reader: R,
     writer: &mut W,
     sandbox: &PathSandbox,
+    required_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    serve_stream(reader, writer, sandbox)
+    serve_stream(reader, writer, sandbox, required_token)
+}
+
+enum LineRead {
+    Eof,
+    Line(String),
+    TooLarge,
+}
+
+fn read_limited_line<R: BufRead>(reader: &mut R, limit: usize) -> std::io::Result<LineRead> {
+    let mut buf = Vec::new();
+    let mut exceeded = false;
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            if exceeded {
+                return Ok(LineRead::TooLarge);
+            }
+            if buf.is_empty() {
+                return Ok(LineRead::Eof);
+            }
+            return Ok(LineRead::Line(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+            if !exceeded {
+                if buf.len() + pos > limit {
+                    exceeded = true;
+                } else {
+                    buf.extend_from_slice(&avail[..pos]);
+                }
+            }
+            reader.consume(pos + 1);
+            if exceeded {
+                return Ok(LineRead::TooLarge);
+            }
+            return Ok(LineRead::Line(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        let len = avail.len();
+        if !exceeded {
+            if buf.len() + len > limit {
+                exceeded = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(avail);
+            }
+        }
+        reader.consume(len);
+    }
 }
 
 fn serve_stream<R: BufRead, W: Write>(
-    reader: R,
+    mut reader: R,
     writer: &mut W,
     sandbox: &PathSandbox,
+    required_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for line_res in reader.lines() {
-        let line = line_res?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
+    let mut auth = SessionAuth {
+        initialized: false,
+        required_token,
+    };
+
+    loop {
+        match read_limited_line(&mut reader, MAX_MCP_MESSAGE_BYTES)? {
+            LineRead::Eof => break,
+            LineRead::TooLarge => {
                 let err_resp = JsonRpcResponse {
                     jsonrpc: "2.0",
                     id: Value::Null,
                     result: None,
                     error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("parse error: {e}"),
+                        code: -32600,
+                        message: format!(
+                            "request exceeds maximum message size ({MAX_MCP_MESSAGE_BYTES} bytes)"
+                        ),
                     }),
                 };
                 write_json_line(writer, &err_resp)?;
                 continue;
             }
-        };
+            LineRead::Line(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err_resp = JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id: Value::Null,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32700,
+                                message: format!("parse error: {e}"),
+                            }),
+                        };
+                        write_json_line(writer, &err_resp)?;
+                        continue;
+                    }
+                };
 
-        // Notifications have no `id`
-        let Some(id) = req.id.clone() else {
-            continue;
-        };
+                let Some(id) = req.id.clone() else {
+                    continue;
+                };
 
-        let resp = handle_request(id, &req.method, &req.params, sandbox);
-        write_json_line(writer, &resp)?;
+                let resp = handle_request(id, &req.method, &req.params, sandbox, &mut auth);
+                write_json_line(writer, &resp)?;
+            }
+        }
     }
     Ok(())
 }
@@ -125,9 +227,25 @@ fn handle_request(
     method: &str,
     params: &Value,
     sandbox: &PathSandbox,
+    auth: &mut SessionAuth,
 ) -> JsonRpcResponse {
-    match method {
-        "initialize" => JsonRpcResponse {
+    if method == "initialize" {
+        if let Some(expected) = auth.required_token.as_deref() {
+            let provided = params.get("token").and_then(Value::as_str).unwrap_or("");
+            if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+                return JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32001,
+                        message: "unauthorized: invalid or missing MCP auth token".to_string(),
+                    }),
+                };
+            }
+        }
+        auth.initialized = true;
+        return JsonRpcResponse {
             jsonrpc: "2.0",
             id,
             result: Some(json!({
@@ -141,13 +259,31 @@ fn handle_request(
                 }
             })),
             error: None,
-        },
-        "ping" => JsonRpcResponse {
+        };
+    }
+
+    if method == "ping" {
+        return JsonRpcResponse {
             jsonrpc: "2.0",
             id,
             result: Some(json!({})),
             error: None,
-        },
+        };
+    }
+
+    if !auth.initialized {
+        return JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32002,
+                message: "session not initialized; call 'initialize' first".to_string(),
+            }),
+        };
+    }
+
+    match method {
         "tools/list" => JsonRpcResponse {
             jsonrpc: "2.0",
             id,
@@ -155,11 +291,11 @@ fn handle_request(
             error: None,
         },
         "tools/call" => {
-            let tool_name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let result = call_tool(tool_name, &args, sandbox);
             JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -180,11 +316,22 @@ fn handle_request(
     }
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn tool_definitions() -> Value {
     json!([
         {
             "name": "evaluate_smiles",
-            "description": "Evaluate one or more SMILES strings (or a batch file inside --read-root) for physicochemical, ADME, druglikeness, and medicinal chemistry metrics.",
+            "description": "Evaluate up to 1000 SMILES strings (or a regular file <=10 MiB inside --read-root) for physicochemical, ADME, druglikeness, and medicinal chemistry metrics.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -197,14 +344,14 @@ fn tool_definitions() -> Value {
                     },
                     "file": {
                         "type": "string",
-                        "description": "Optional path to .smi/.csv/.sdf file inside --read-root."
+                        "description": "Optional path to .smi/.csv/.sdf regular file inside --read-root."
                     }
                 }
             }
         },
         {
             "name": "filter_druglikeness",
-            "description": "Filter a list of SMILES compounds by Lipinski violations, BBB permeability, GI absorption, and PAINS/Brenk alerts.",
+            "description": "Filter up to 1000 SMILES compounds by Lipinski violations, BBB permeability, GI absorption, and PAINS/Brenk alerts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -236,7 +383,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "export_report",
-            "description": "Generate a CSV, JSON, PDF, or BOILED-Egg SVG report strictly inside --write-root.",
+            "description": "Atomically generate a CSV, JSON, PDF, or BOILED-Egg SVG report strictly inside --write-root using O_NOFOLLOW.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -256,10 +403,10 @@ fn tool_definitions() -> Value {
     ])
 }
 
-fn tool_ok(payload: Value) -> Value {
-    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+/// Build MCP success response without duplicating large JSON trees twice on the wire.
+fn tool_ok(summary: String, payload: Value) -> Value {
     json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": [{ "type": "text", "text": summary }],
         "structuredContent": payload,
         "isError": false
     })
@@ -283,13 +430,18 @@ fn call_tool(name: &str, args: &Value, sandbox: &PathSandbox) -> Value {
     }
 }
 
-fn collect_smiles_inputs(args: &Value) -> Vec<String> {
+fn collect_smiles_inputs(args: &Value) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     if let Some(s) = args.get("smiles").and_then(Value::as_str) {
         for l in s.lines() {
             let t = l.trim();
             if !t.is_empty() {
                 lines.push(t.to_string());
+                if lines.len() > MAX_MCP_MOLECULES {
+                    return Err(format!(
+                        "batch exceeds maximum allowed {MAX_MCP_MOLECULES} molecules per MCP call"
+                    ));
+                }
             }
         }
     } else if let Some(arr) = args.get("smiles").and_then(Value::as_array) {
@@ -298,11 +450,16 @@ fn collect_smiles_inputs(args: &Value) -> Vec<String> {
                 let t = s.trim();
                 if !t.is_empty() {
                     lines.push(t.to_string());
+                    if lines.len() > MAX_MCP_MOLECULES {
+                        return Err(format!(
+                            "batch exceeds maximum allowed {MAX_MCP_MOLECULES} molecules per MCP call"
+                        ));
+                    }
                 }
             }
         }
     }
-    lines
+    Ok(lines)
 }
 
 fn eval_lines(lines: &[String]) -> (Vec<MoleculeEvaluation>, Vec<Value>) {
@@ -321,14 +478,11 @@ fn eval_lines(lines: &[String]) -> (Vec<MoleculeEvaluation>, Vec<Value>) {
 
 fn tool_evaluate_smiles(args: &Value, sandbox: &PathSandbox) -> Value {
     if let Some(file_str) = args.get("file").and_then(Value::as_str) {
-        let resolved = match sandbox.resolve_read(Path::new(file_str)) {
-            Ok(p) => p,
-            Err(e) => return tool_err(format!("read sandbox error: {e}")),
-        };
-        let content = match std::fs::read_to_string(&resolved) {
-            Ok(c) => c,
-            Err(e) => return tool_err(format!("failed to read file: {e}")),
-        };
+        let (resolved, content) =
+            match sandbox.read_to_string_limited(Path::new(file_str), MAX_READ_BYTES) {
+                Ok(res) => res,
+                Err(e) => return tool_err(format!("read sandbox error: {e}")),
+            };
         let ext = resolved
             .extension()
             .and_then(|e| e.to_str())
@@ -337,7 +491,11 @@ fn tool_evaluate_smiles(args: &Value, sandbox: &PathSandbox) -> Value {
         let mut mols = Vec::new();
         let mut errors = Vec::new();
         if ext == "sdf" || ext == "mol" {
-            for (i, res) in parse_sdf(&content).into_iter().enumerate() {
+            for (i, res) in parse_sdf(&content)
+                .into_iter()
+                .take(MAX_MCP_MOLECULES)
+                .enumerate()
+            {
                 match res {
                     Ok(m) => mols.push(m),
                     Err(e) => errors.push(json!({ "record": i + 1, "error": e.to_string() })),
@@ -346,7 +504,7 @@ fn tool_evaluate_smiles(args: &Value, sandbox: &PathSandbox) -> Value {
         } else if ext == "csv" {
             match parse_csv_batch(&content) {
                 Ok(items) => {
-                    for (i, res) in items.into_iter().enumerate() {
+                    for (i, res) in items.into_iter().take(MAX_MCP_MOLECULES).enumerate() {
                         match res {
                             Ok(m) => mols.push(m),
                             Err(e) => errors.push(json!({ "row": i + 2, "error": e.to_string() })),
@@ -356,35 +514,61 @@ fn tool_evaluate_smiles(args: &Value, sandbox: &PathSandbox) -> Value {
                 Err(e) => return tool_err(format!("CSV parse error: {e}")),
             }
         } else {
-            for (line_no, raw, res) in parse_smiles_batch(&content) {
+            for (line_no, raw, res) in parse_smiles_batch(&content)
+                .into_iter()
+                .take(MAX_MCP_MOLECULES)
+            {
                 match res {
                     Ok(m) => mols.push(m),
-                    Err(e) => errors.push(json!({ "line": line_no, "input": raw, "error": e.to_string() })),
+                    Err(e) => errors
+                        .push(json!({ "line": line_no, "input": raw, "error": e.to_string() })),
                 }
             }
         }
         let evals = evaluate_batch(&mols);
-        return tool_ok(json!({
-            "count": evals.len(),
-            "results": evals,
-            "errors": errors,
-        }));
+        let summary = format!(
+            "Evaluated {} molecule(s) from {}",
+            evals.len(),
+            resolved.display()
+        );
+        return tool_ok(
+            summary,
+            json!({
+                "count": evals.len(),
+                "results": evals,
+                "errors": errors,
+            }),
+        );
     }
 
-    let lines = collect_smiles_inputs(args);
+    let lines = match collect_smiles_inputs(args) {
+        Ok(l) => l,
+        Err(msg) => return tool_err(msg),
+    };
     if lines.is_empty() {
         return tool_err("provide 'smiles' (string or array) or 'file' inside --read-root");
     }
     let (evals, errors) = eval_lines(&lines);
-    tool_ok(json!({
-        "count": evals.len(),
-        "results": evals,
-        "errors": errors,
-    }))
+    let summary = format!(
+        "Evaluated {} molecule(s) ({} error(s))",
+        evals.len(),
+        errors.len()
+    );
+    tool_ok(
+        summary,
+        json!({
+            "count": evals.len(),
+            "results": evals,
+            "errors": errors,
+        }),
+    )
 }
 
 fn tool_filter_druglikeness(args: &Value) -> Value {
-    let lines = collect_smiles_inputs(args);
+    let lines = match collect_smiles_inputs(args) {
+        Ok(l) => l,
+        Err(msg) => return tool_err(msg),
+    };
     if lines.is_empty() {
         return tool_err("'smiles' array must not be empty");
     }
@@ -395,21 +579,29 @@ fn tool_filter_druglikeness(args: &Value) -> Value {
             .map(|v| v as usize),
         require_bbb: args.get("bbb_permeant").and_then(Value::as_bool),
         require_gi_high: args.get("gi_high").and_then(Value::as_bool),
-        no_pains: args.get("no_pains").and_then(Value::as_bool).unwrap_or(false),
-        no_brenk: args.get("no_brenk").and_then(Value::as_bool).unwrap_or(false),
+        no_pains: args
+            .get("no_pains")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        no_brenk: args
+            .get("no_brenk")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
     let (evals, errors) = eval_lines(&lines);
     let total = evals.len();
-    let passed: Vec<MoleculeEvaluation> = evals
-        .into_iter()
-        .filter(|e| criteria.matches(e))
-        .collect();
-    tool_ok(json!({
-        "total_evaluated": total,
-        "matched_count": passed.len(),
-        "matched": passed,
-        "errors": errors,
-    }))
+    let passed: Vec<MoleculeEvaluation> =
+        evals.into_iter().filter(|e| criteria.matches(e)).collect();
+    let summary = format!("Matched {}/{} molecule(s)", passed.len(), total);
+    tool_ok(
+        summary,
+        json!({
+            "total_evaluated": total,
+            "matched_count": passed.len(),
+            "matched": passed,
+            "errors": errors,
+        }),
+    )
 }
 
 fn tool_inspect_molecule(args: &Value) -> Value {
@@ -426,23 +618,33 @@ fn tool_inspect_molecule(args: &Value) -> Value {
         Ok(e) => e,
         Err(e) => return tool_err(format!("evaluation failed: {e}")),
     };
-    tool_ok(json!({
-        "name": eval.name,
-        "canonical_smiles": eval.canonical_smiles,
-        "formula": eval.physicochemical.formula,
-        "heavy_atoms": mol.heavy_atom_count(),
-        "aromatic_heavy_atoms": mol.aromatic_heavy_atom_count(),
-        "rings": mol.rings,
-        "atoms": mol.atoms,
-        "bonds": mol.bonds,
-        "pains_alerts": eval.medicinal_chemistry.pains_alerts,
-        "brenk_alerts": eval.medicinal_chemistry.brenk_alerts,
-        "synthetic_accessibility": eval.medicinal_chemistry.synthetic_accessibility,
-    }))
+    let summary = format!("Inspected {} ({})", eval.name, eval.physicochemical.formula);
+    tool_ok(
+        summary,
+        json!({
+            "name": eval.name,
+            "canonical_smiles": eval.canonical_smiles,
+            "formula": eval.physicochemical.formula,
+            "warnings": eval.warnings,
+            "heavy_atoms": mol.heavy_atom_count(),
+            "aromatic_heavy_atoms": mol.aromatic_heavy_atom_count(),
+            "rings": mol.rings,
+            "atoms": mol.atoms,
+            "bonds": mol.bonds,
+            "pains_alerts": eval.medicinal_chemistry.pains_alerts,
+            "pains_catalog_size": eval.medicinal_chemistry.pains_catalog_size,
+            "brenk_alerts": eval.medicinal_chemistry.brenk_alerts,
+            "brenk_catalog_size": eval.medicinal_chemistry.brenk_catalog_size,
+            "synthetic_accessibility": eval.medicinal_chemistry.synthetic_accessibility,
+        }),
+    )
 }
 
 fn tool_export_report(args: &Value, sandbox: &PathSandbox) -> Value {
-    let lines = collect_smiles_inputs(args);
+    let lines = match collect_smiles_inputs(args) {
+        Ok(l) => l,
+        Err(msg) => return tool_err(msg),
+    };
     if lines.is_empty() {
         return tool_err("'smiles' list must not be empty");
     }
@@ -462,23 +664,32 @@ fn tool_export_report(args: &Value, sandbox: &PathSandbox) -> Value {
         other => return tool_err(format!("unsupported format '{other}'")),
     };
 
-    let resolved = match sandbox.resolve_write(Path::new(out_str)) {
-        Ok(p) => p,
-        Err(e) => return tool_err(format!("write sandbox error: {e}")),
-    };
-
     let (evals, errors) = eval_lines(&lines);
     if evals.is_empty() {
         return tool_err("no valid molecules to export");
     }
-    if let Err(e) = write_report_file(&evals, &resolved, format) {
+
+    // Atomically validate and open with O_NOFOLLOW, writing directly to the fd (no TOCTOU)
+    let (resolved, mut file) = match sandbox.open_write(Path::new(out_str)) {
+        Ok(pair) => pair,
+        Err(e) => return tool_err(format!("write sandbox error: {e}")),
+    };
+    if let Err(e) = write_report_to_writer(&evals, &mut file, format) {
         return tool_err(format!("export error: {e}"));
     }
 
-    tool_ok(json!({
-        "written_path": resolved.display().to_string(),
-        "format": fmt_str,
-        "exported_count": evals.len(),
-        "errors": errors,
-    }))
+    let summary = format!(
+        "Exported {} molecule(s) to {}",
+        evals.len(),
+        resolved.display()
+    );
+    tool_ok(
+        summary,
+        json!({
+            "written_path": resolved.display().to_string(),
+            "format": fmt_str,
+            "exported_count": evals.len(),
+            "errors": errors,
+        }),
+    )
 }

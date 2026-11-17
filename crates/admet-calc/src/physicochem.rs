@@ -114,10 +114,7 @@ fn is_symmetric_cx3(mol: &Molecule, term_c: usize, anchor: usize) -> bool {
     if ac.atomic_number != 6 || ac.total_h() != 0 || mol.adj[term_c].len() != 4 {
         return false;
     }
-    let others: Vec<usize> = mol
-        .neighbors(term_c)
-        .filter(|&nbr| nbr != anchor)
-        .collect();
+    let others: Vec<usize> = mol.neighbors(term_c).filter(|&nbr| nbr != anchor).collect();
     if others.len() != 3 {
         return false;
     }

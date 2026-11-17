@@ -93,7 +93,9 @@ pub fn parse_mol_block(block: &str, default_name: &str) -> Result<Molecule, Chem
             let s1 = line.get(0..3).unwrap_or("").trim();
             let s2 = line.get(3..6).unwrap_or("").trim();
             let s3 = line.get(6..9).unwrap_or("").trim();
-            if let (Ok(u), Ok(v), Ok(t)) = (s1.parse::<usize>(), s2.parse::<usize>(), s3.parse::<u8>()) {
+            if let (Ok(u), Ok(v), Ok(t)) =
+                (s1.parse::<usize>(), s2.parse::<usize>(), s3.parse::<u8>())
+            {
                 (u, v, t)
             } else {
                 parse_bond_tokens(line, line_num + 1)?
@@ -128,14 +130,22 @@ pub fn parse_mol_block(block: &str, default_name: &str) -> Result<Molecule, Chem
                 .filter_map(|t| t.parse::<i32>().ok())
                 .collect();
             if let Some(&count) = nums.first() {
-                for pair in nums[1..].as_chunks::<2>().0.iter().take(count.max(0) as usize) {
+                for pair in nums[1..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .take(count.max(0) as usize)
+                {
                     let a_idx = (pair[0] - 1) as usize;
                     if let Some(atom) = mol.atoms.get_mut(a_idx) {
                         atom.formal_charge = pair[1].clamp(-15, 15) as i8;
                     }
                 }
             }
-        } else if (line.contains("<NAME>") || line.contains("<Name>") || line.contains("<ID>") || line.contains("<COMMON_NAME>"))
+        } else if (line.contains("<NAME>")
+            || line.contains("<Name>")
+            || line.contains("<ID>")
+            || line.contains("<COMMON_NAME>"))
             && title.is_empty()
             && let Some(next_li) = prop_lines.next()
         {
@@ -147,6 +157,7 @@ pub fn parse_mol_block(block: &str, default_name: &str) -> Result<Molecule, Chem
     }
 
     mol.suppress_explicit_hydrogens();
+    mol.desalt();
     mol.perceive()?;
     mol.input_smiles = Some(mol.to_canonical_smiles());
     Ok(mol)

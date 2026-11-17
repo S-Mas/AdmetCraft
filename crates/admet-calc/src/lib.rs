@@ -26,10 +26,7 @@ pub enum AdmetError {
 
 /// Evaluate a parsed `Molecule` and produce the full ADMET profile.
 pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
-    let name = mol
-        .name
-        .clone()
-        .unwrap_or_else(|| "Molecule 1".to_string());
+    let name = mol.name.clone().unwrap_or_else(|| "Molecule 1".to_string());
     let canonical_smiles = mol.to_canonical_smiles();
     let input_smiles = mol
         .input_smiles
@@ -38,19 +35,20 @@ pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
 
     let physicochemical = physicochem::compute_physicochemical(mol);
     let lipophilicity = lipophilicity::compute_lipophilicity(mol);
-    let water_solubility = solubility::compute_water_solubility(mol, &physicochemical, &lipophilicity);
+    let water_solubility =
+        solubility::compute_water_solubility(mol, &physicochemical, &lipophilicity);
     let (pharmacokinetics, boiled_egg) =
         pharmacokinetics::compute_pharmacokinetics(mol, &physicochemical, &lipophilicity);
     let druglikeness = druglikeness::compute_druglikeness(mol, &physicochemical, &lipophilicity);
     let medicinal_chemistry =
         medchem::compute_medicinal_chemistry(mol, &physicochemical, &lipophilicity);
-    let bioavailability_radar =
-        compute_radar(&physicochemical, &lipophilicity, &water_solubility);
+    let bioavailability_radar = compute_radar(&physicochemical, &lipophilicity, &water_solubility);
 
     MoleculeEvaluation {
         name,
         input_smiles,
         canonical_smiles,
+        warnings: mol.warnings.clone(),
         physicochemical,
         lipophilicity,
         water_solubility,
@@ -210,54 +208,109 @@ mod tests {
                 eval.druglikeness.veber.pass,
             );
             if eval.physicochemical.formula != r.formula {
-                failures.push(format!("{}: formula {} != {}", r.name, eval.physicochemical.formula, r.formula));
+                failures.push(format!(
+                    "{}: formula {} != {}",
+                    r.name, eval.physicochemical.formula, r.formula
+                ));
             }
             if (eval.physicochemical.molecular_weight - r.mw).abs() >= 0.1 {
-                failures.push(format!("{}: MW {} != {}", r.name, eval.physicochemical.molecular_weight, r.mw));
+                failures.push(format!(
+                    "{}: MW {} != {}",
+                    r.name, eval.physicochemical.molecular_weight, r.mw
+                ));
             }
             if eval.physicochemical.heavy_atoms != r.heavy_atoms {
-                failures.push(format!("{}: HA {} != {}", r.name, eval.physicochemical.heavy_atoms, r.heavy_atoms));
+                failures.push(format!(
+                    "{}: HA {} != {}",
+                    r.name, eval.physicochemical.heavy_atoms, r.heavy_atoms
+                ));
             }
             if eval.physicochemical.aromatic_heavy_atoms != r.aromatic_heavy_atoms {
-                failures.push(format!("{}: ArHA {} != {}", r.name, eval.physicochemical.aromatic_heavy_atoms, r.aromatic_heavy_atoms));
+                failures.push(format!(
+                    "{}: ArHA {} != {}",
+                    r.name, eval.physicochemical.aromatic_heavy_atoms, r.aromatic_heavy_atoms
+                ));
             }
             if (eval.physicochemical.fraction_csp3 - r.fsp3).abs() > 0.02 {
-                failures.push(format!("{}: Fsp3 {} != {}", r.name, eval.physicochemical.fraction_csp3, r.fsp3));
+                failures.push(format!(
+                    "{}: Fsp3 {} != {}",
+                    r.name, eval.physicochemical.fraction_csp3, r.fsp3
+                ));
             }
             if eval.physicochemical.rotatable_bonds != r.rotatable_bonds {
-                failures.push(format!("{}: RB {} != {}", r.name, eval.physicochemical.rotatable_bonds, r.rotatable_bonds));
+                failures.push(format!(
+                    "{}: RB {} != {}",
+                    r.name, eval.physicochemical.rotatable_bonds, r.rotatable_bonds
+                ));
             }
             if eval.physicochemical.h_bond_donors != r.hbd {
-                failures.push(format!("{}: HBD {} != {}", r.name, eval.physicochemical.h_bond_donors, r.hbd));
+                failures.push(format!(
+                    "{}: HBD {} != {}",
+                    r.name, eval.physicochemical.h_bond_donors, r.hbd
+                ));
             }
             if (eval.physicochemical.tpsa - r.tpsa).abs() > 0.25 {
-                failures.push(format!("{}: TPSA {} != {}", r.name, eval.physicochemical.tpsa, r.tpsa));
+                failures.push(format!(
+                    "{}: TPSA {} != {}",
+                    r.name, eval.physicochemical.tpsa, r.tpsa
+                ));
             }
-            if eval.lipophilicity.wlogp < r.wlogp_range[0] || eval.lipophilicity.wlogp > r.wlogp_range[1] {
-                failures.push(format!("{}: WLOGP {} not in {:?}", r.name, eval.lipophilicity.wlogp, r.wlogp_range));
+            if eval.lipophilicity.wlogp < r.wlogp_range[0]
+                || eval.lipophilicity.wlogp > r.wlogp_range[1]
+            {
+                failures.push(format!(
+                    "{}: WLOGP {} not in {:?}",
+                    r.name, eval.lipophilicity.wlogp, r.wlogp_range
+                ));
             }
-            if eval.water_solubility.esol.log_s < r.esol_range[0] || eval.water_solubility.esol.log_s > r.esol_range[1] {
-                failures.push(format!("{}: ESOL {} not in {:?}", r.name, eval.water_solubility.esol.log_s, r.esol_range));
+            if eval.water_solubility.esol.log_s < r.esol_range[0]
+                || eval.water_solubility.esol.log_s > r.esol_range[1]
+            {
+                failures.push(format!(
+                    "{}: ESOL {} not in {:?}",
+                    r.name, eval.water_solubility.esol.log_s, r.esol_range
+                ));
             }
             if eval.pharmacokinetics.gi_absorption.as_str() != r.gi_absorption {
-                failures.push(format!("{}: GI {} != {}", r.name, eval.pharmacokinetics.gi_absorption.as_str(), r.gi_absorption));
+                failures.push(format!(
+                    "{}: GI {} != {}",
+                    r.name,
+                    eval.pharmacokinetics.gi_absorption.as_str(),
+                    r.gi_absorption
+                ));
             }
             if let Some(bbb) = r.bbb_permeant
                 && eval.pharmacokinetics.bbb_permeant != bbb
             {
-                failures.push(format!("{}: BBB {} != {}", r.name, eval.pharmacokinetics.bbb_permeant, bbb));
+                failures.push(format!(
+                    "{}: BBB {} != {}",
+                    r.name, eval.pharmacokinetics.bbb_permeant, bbb
+                ));
             }
             if eval.druglikeness.lipinski.pass != r.lipinski_yes {
-                failures.push(format!("{}: Lipinski {} != {}", r.name, eval.druglikeness.lipinski.pass, r.lipinski_yes));
+                failures.push(format!(
+                    "{}: Lipinski {} != {}",
+                    r.name, eval.druglikeness.lipinski.pass, r.lipinski_yes
+                ));
             }
             if eval.druglikeness.lipinski.violations > r.lipinski_max_violations {
-                failures.push(format!("{}: Lipinski viol {} > {}", r.name, eval.druglikeness.lipinski.violations, r.lipinski_max_violations));
+                failures.push(format!(
+                    "{}: Lipinski viol {} > {}",
+                    r.name, eval.druglikeness.lipinski.violations, r.lipinski_max_violations
+                ));
             }
             if eval.druglikeness.veber.pass != r.veber_yes {
-                failures.push(format!("{}: Veber {} != {}", r.name, eval.druglikeness.veber.pass, r.veber_yes));
+                failures.push(format!(
+                    "{}: Veber {} != {}",
+                    r.name, eval.druglikeness.veber.pass, r.veber_yes
+                ));
             }
         }
-        assert!(failures.is_empty(), "Reference mismatches:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "Reference mismatches:\n{}",
+            failures.join("\n")
+        );
         Ok(())
     }
 
@@ -269,6 +322,65 @@ mod tests {
 
         let aspirin = evaluate_smiles("CC(=O)Oc1ccccc1C(=O)O", Some("Aspirin"))?;
         assert!(aspirin.medicinal_chemistry.pains_alerts.is_empty());
+        assert_eq!(aspirin.medicinal_chemistry.pains_catalog_size, 26);
+        assert_eq!(aspirin.medicinal_chemistry.brenk_catalog_size, 25);
+        assert!(aspirin.medicinal_chemistry.sa_is_heuristic_proxy);
+        Ok(())
+    }
+
+    #[test]
+    fn sa_score_distinguishes_ethanol_from_taxol() -> Result<(), Box<dyn std::error::Error>> {
+        let ethanol = evaluate_smiles("CCO", Some("Ethanol"))?;
+        assert!(
+            ethanol.medicinal_chemistry.synthetic_accessibility <= 1.2,
+            "Ethanol SA too high: {}",
+            ethanol.medicinal_chemistry.synthetic_accessibility
+        );
+        let taxol = evaluate_smiles(
+            "CC(=O)OC1C(=O)C2(C)C(O)CC3OCC3(OC(C)=O)C2C(OC(=O)c2ccccc2)C2(O)CC(OC(=O)C(O)C(NC(=O)c3ccccc3)c3ccccc3)C(C)=C1C2(C)C",
+            Some("Taxol"),
+        )?;
+        assert!(
+            taxol.medicinal_chemistry.synthetic_accessibility > 5.0
+                && taxol.medicinal_chemistry.synthetic_accessibility < 9.8,
+            "Taxol SA unexpected: {}",
+            taxol.medicinal_chemistry.synthetic_accessibility
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn experimental_cyp_and_pgp_heuristics_run_cleanly() -> Result<(), Box<dyn std::error::Error>> {
+        let atorvastatin = evaluate_smiles(
+            "CC(C)c1c(C(=O)Nc2ccccc2)c(-c2ccccc2)c(-c2ccc(F)cc2)n1CCC(O)CC(O)CC(=O)O",
+            Some("Atorvastatin"),
+        )?;
+        assert!(
+            atorvastatin
+                .pharmacokinetics
+                .pgp_cyp_are_experimental_heuristics
+        );
+        assert!(atorvastatin.pharmacokinetics.pgp_substrate);
+        assert!(atorvastatin.pharmacokinetics.cyp3a4_inhibitor);
+
+        let fluoxetine = evaluate_smiles("CNCCC(Oc1ccc(C(F)(F)F)cc1)c1ccccc1", Some("Fluoxetine"))?;
+        assert!(fluoxetine.pharmacokinetics.cyp2d6_inhibitor);
+        Ok(())
+    }
+
+    #[test]
+    fn warnings_propagate_for_salts_and_stereo() -> Result<(), Box<dyn std::error::Error>> {
+        let salt = evaluate_smiles("CC(=O)[O-].[Na+]", Some("SodiumAcetate"))?;
+        assert!(salt.warnings.iter().any(|w| w.contains("Desalted")));
+        assert!((salt.physicochemical.molecular_weight - 59.04).abs() < 0.1);
+
+        let chiral = evaluate_smiles("C[C@@H](C(=O)O)N", Some("L-Alanine"))?;
+        assert!(
+            chiral
+                .warnings
+                .iter()
+                .any(|w| w.contains("Stereochemistry"))
+        );
         Ok(())
     }
 }

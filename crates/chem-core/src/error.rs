@@ -55,6 +55,15 @@ pub enum ChemError {
         msg: String,
     },
 
+    /// Molecular input exceeds configured atom safety limit.
+    #[error("molecule has {count} atoms, exceeding maximum allowed limit of {limit}")]
+    TooManyAtoms {
+        /// Atom count in the input.
+        count: usize,
+        /// Configured upper limit.
+        limit: usize,
+    },
+
     /// Internal graph indexing error.
     #[error("molecular graph error: {0}")]
     Graph(String),

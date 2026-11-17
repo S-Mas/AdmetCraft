@@ -37,7 +37,10 @@ pub fn generate_2d_coords(mol: &mut Molecule) {
         // Place ring systems belonging to this component first, or start at first atom
         let mut comp_systems: Vec<&Vec<usize>> = ring_systems
             .iter()
-            .filter(|rs| rs.iter().any(|&ri| mol.rings[ri].iter().any(|a| comp_set.contains(a))))
+            .filter(|rs| {
+                rs.iter()
+                    .any(|&ri| mol.rings[ri].iter().any(|a| comp_set.contains(a)))
+            })
             .collect();
         comp_systems.sort_by_key(|rs| std::cmp::Reverse(rs.len()));
 
@@ -52,19 +55,13 @@ pub fn generate_2d_coords(mol: &mut Molecule) {
         let mut q: VecDeque<usize> = comp.iter().copied().filter(|&a| placed[a]).collect();
         while let Some(u) = q.pop_front() {
             // Collect unplaced neighbors
-            let unplaced_nbrs: Vec<usize> = mol
-                .neighbors(u)
-                .filter(|&v| !placed[v])
-                .collect();
+            let unplaced_nbrs: Vec<usize> = mol.neighbors(u).filter(|&v| !placed[v]).collect();
             if unplaced_nbrs.is_empty() {
                 continue;
             }
 
             // Compute average incoming angle from already-placed neighbors
-            let placed_nbrs: Vec<usize> = mol
-                .neighbors(u)
-                .filter(|&v| placed[v])
-                .collect();
+            let placed_nbrs: Vec<usize> = mol.neighbors(u).filter(|&v| placed[v]).collect();
 
             let base_angle = if placed_nbrs.is_empty() {
                 0.0
@@ -118,7 +115,8 @@ pub fn generate_2d_coords(mol: &mut Molecule) {
                 } else {
                     let ang = if placed_nbrs.len() == 1 && unplaced_nbrs.len() == 1 {
                         let p = placed_nbrs[0];
-                        let incoming = (coords[u][1] - coords[p][1]).atan2(coords[u][0] - coords[p][0]);
+                        let incoming =
+                            (coords[u][1] - coords[p][1]).atan2(coords[u][0] - coords[p][0]);
                         let is_sp = mol
                             .bond_between(u, p)
                             .is_some_and(|b| b.order == BondOrder::Triple)
@@ -149,15 +147,22 @@ pub fn generate_2d_coords(mol: &mut Molecule) {
                         }
                     } else if unplaced_nbrs.len() == 2 && placed_nbrs.len() == 1 {
                         let p = placed_nbrs[0];
-                        let incoming = (coords[u][1] - coords[p][1]).atan2(coords[u][0] - coords[p][0]);
+                        let incoming =
+                            (coords[u][1] - coords[p][1]).atan2(coords[u][0] - coords[p][0]);
                         // Test candidate tilts (-25, 0, +25 deg) to avoid colliding with ortho neighbors
                         let mut best_offset = 0.0;
                         let mut best_clearance = -1.0;
                         for &off in &[0.0, 0.35, -0.35, 0.65, -0.65] {
                             let a1 = incoming + off + PI / 3.0;
                             let a2 = incoming + off - PI / 3.0;
-                            let c1 = [coords[u][0] + BOND_LEN * a1.cos(), coords[u][1] + BOND_LEN * a1.sin()];
-                            let c2 = [coords[u][0] + BOND_LEN * a2.cos(), coords[u][1] + BOND_LEN * a2.sin()];
+                            let c1 = [
+                                coords[u][0] + BOND_LEN * a1.cos(),
+                                coords[u][1] + BOND_LEN * a1.sin(),
+                            ];
+                            let c2 = [
+                                coords[u][0] + BOND_LEN * a2.cos(),
+                                coords[u][1] + BOND_LEN * a2.sin(),
+                            ];
                             let cl = min_dist_to_placed(c1, &coords, &placed, u)
                                 .min(min_dist_to_placed(c2, &coords, &placed, u));
                             if cl > best_clearance {
@@ -270,12 +275,7 @@ fn build_ring_systems(mol: &Molecule) -> Vec<Vec<usize>> {
     systems
 }
 
-fn place_ring_system(
-    mol: &Molecule,
-    sys: &[usize],
-    coords: &mut [[f64; 2]],
-    placed: &mut [bool],
-) {
+fn place_ring_system(mol: &Molecule, sys: &[usize], coords: &mut [[f64; 2]], placed: &mut [bool]) {
     let Some(&first_ri) = sys.first() else {
         return;
     };
@@ -402,6 +402,11 @@ fn place_fused_ring(ring: &[usize], coords: &mut [[f64; 2]], placed: &mut [bool]
     if m < 3 {
         return;
     }
+    let placed_cnt = ring.iter().filter(|&&a| placed[a]).count();
+    if placed_cnt >= 3 {
+        place_bridged_ring(ring, coords, placed);
+        return;
+    }
     // Find an adjacent placed pair (ring[i], ring[(i+1)%m])
     let mut pair_idx = None;
     for i in 0..m {
@@ -473,6 +478,58 @@ fn place_fused_ring(ring: &[usize], coords: &mut [[f64; 2]], placed: &mut [bool]
                 center[0] + radius * ang.cos(),
                 center[1] + radius * ang.sin(),
             ];
+            placed[aid] = true;
+        }
+    }
+}
+
+fn place_bridged_ring(ring: &[usize], coords: &mut [[f64; 2]], placed: &mut [bool]) {
+    let m = ring.len();
+    let placed_pts: Vec<[f64; 2]> = ring
+        .iter()
+        .filter(|&&a| placed[a])
+        .map(|&a| coords[a])
+        .collect();
+    if placed_pts.is_empty() {
+        return;
+    }
+    let cx = placed_pts.iter().map(|p| p[0]).sum::<f64>() / placed_pts.len() as f64;
+    let cy = placed_pts.iter().map(|p| p[1]).sum::<f64>() / placed_pts.len() as f64;
+
+    // Walk around ring and place any contiguous unplaced run between its placed flanking atoms
+    let Some(first_placed) = ring.iter().position(|&a| placed[a]) else {
+        return;
+    };
+    let mut i = 0usize;
+    while i < m {
+        let idx = (first_placed + i) % m;
+        if placed[ring[idx]] {
+            i += 1;
+            continue;
+        }
+        let start_anchor = ring[(first_placed + i + m - 1) % m];
+        let mut run = Vec::new();
+        while i < m && !placed[ring[(first_placed + i) % m]] {
+            run.push(ring[(first_placed + i) % m]);
+            i += 1;
+        }
+        let end_anchor = ring[(first_placed + i) % m];
+        let p0 = coords[start_anchor];
+        let p1 = coords[end_anchor];
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let chord = (dx * dx + dy * dy).sqrt().max(1e-6);
+        let nx = -dy / chord;
+        let ny = dx / chord;
+        let mid = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
+        // Bow slightly away from the centroid of placed ring atoms (or perpendicular if collinear)
+        let dot = (mid[0] - cx) * nx + (mid[1] - cy) * ny;
+        let sign = if dot >= 0.0 { 1.0 } else { -1.0 };
+        let k = run.len();
+        for (j, &aid) in run.iter().enumerate() {
+            let t = (j + 1) as f64 / (k + 1) as f64;
+            let arch = (PI * t).sin() * BOND_LEN * 0.45 * sign;
+            coords[aid] = [p0[0] + dx * t + nx * arch, p0[1] + dy * t + ny * arch];
             placed[aid] = true;
         }
     }
@@ -599,16 +656,20 @@ fn relax_overlaps(mol: &Molecule, comp: &[usize], coords: &mut [[f64; 2]], iters
             let dx = coords[b.v][0] - coords[b.u][0];
             let dy = coords[b.v][1] - coords[b.u][1];
             let d = (dx * dx + dy * dy).sqrt().max(1e-6);
-            let pull = 0.15 * (d - BOND_LEN) / d;
+            let stiffness = if b.in_ring { 0.25 } else { 0.18 };
+            let pull = stiffness * (d - BOND_LEN) / d;
             forces[b.u][0] += dx * pull;
             forces[b.u][1] += dy * pull;
             forces[b.v][0] -= dx * pull;
             forces[b.v][1] -= dy * pull;
         }
+        // Keep simple planar aromatic rings rigid; allow bridged rings & acyclic atoms to relax
         for &u in comp {
-            if !mol.atoms[u].in_ring {
-                coords[u][0] += forces[u][0].clamp(-0.2, 0.2);
-                coords[u][1] += forces[u][1].clamp(-0.2, 0.2);
+            let is_simple_aromatic_ring =
+                mol.atoms[u].in_ring && mol.atoms[u].aromatic && mol.atoms[u].ring_sizes.len() <= 2;
+            if !is_simple_aromatic_ring {
+                coords[u][0] += forces[u][0].clamp(-0.22, 0.22);
+                coords[u][1] += forces[u][1].clamp(-0.22, 0.22);
             }
         }
     }

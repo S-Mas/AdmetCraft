@@ -6,5 +6,5 @@ Exec=admetcraft
 Icon=admetcraft
 Terminal=false
 Categories=Science;Chemistry;Education;
-Keywords=ADMET;SMILES;Cheminformatics;SwissADME;
+Keywords=ADMET;SMILES;Cheminformatics;Pharmacology;
 StartupNotify=true

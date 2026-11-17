@@ -177,8 +177,9 @@ impl SmartsPattern {
                         return true;
                     }
                     let om = mapping[other_pat];
-                    mol.bond_between(cand_mol, om)
-                        .is_some_and(|mb2| bond_matches(mb2.order, mb2.in_ring, &self.bonds[other_bid].expr))
+                    mol.bond_between(cand_mol, om).is_some_and(|mb2| {
+                        bond_matches(mb2.order, mb2.in_ring, &self.bonds[other_bid].expr)
+                    })
                 });
                 if !ok_all {
                     continue;
@@ -287,8 +288,9 @@ impl SmartsPattern {
                         return true;
                     }
                     let om = mapping[other_pat];
-                    mol.bond_between(cand_mol, om)
-                        .is_some_and(|mb2| bond_matches(mb2.order, mb2.in_ring, &self.bonds[other_bid].expr))
+                    mol.bond_between(cand_mol, om).is_some_and(|mb2| {
+                        bond_matches(mb2.order, mb2.in_ring, &self.bonds[other_bid].expr)
+                    })
                 });
                 if !ok_all {
                     continue;
@@ -408,7 +410,11 @@ impl<'a> SmartsParser<'a> {
                     self.atoms.push(expr);
                     if let Some(prev) = current {
                         let bexpr = pending_bond.take().unwrap_or(BondExpr::SingleOrAromatic);
-                        self.bonds.push(SmartsBond { u: prev, v: idx, expr: bexpr });
+                        self.bonds.push(SmartsBond {
+                            u: prev,
+                            v: idx,
+                            expr: bexpr,
+                        });
                     } else {
                         pending_bond = None;
                     }
@@ -420,7 +426,11 @@ impl<'a> SmartsParser<'a> {
                     self.atoms.push(expr);
                     if let Some(prev) = current {
                         let bexpr = pending_bond.take().unwrap_or(BondExpr::SingleOrAromatic);
-                        self.bonds.push(SmartsBond { u: prev, v: idx, expr: bexpr });
+                        self.bonds.push(SmartsBond {
+                            u: prev,
+                            v: idx,
+                            expr: bexpr,
+                        });
                     } else {
                         pending_bond = None;
                     }
@@ -446,7 +456,11 @@ impl<'a> SmartsParser<'a> {
     ) {
         if let Some((start, start_bond)) = opens.remove(&rnum) {
             let expr = bexpr.or(start_bond).unwrap_or(BondExpr::SingleOrAromatic);
-            self.bonds.push(SmartsBond { u: start, v: anchor, expr });
+            self.bonds.push(SmartsBond {
+                u: start,
+                v: anchor,
+                expr,
+            });
         } else {
             opens.insert(rnum, (anchor, bexpr));
         }
@@ -543,7 +557,9 @@ impl<'a> SmartsParser<'a> {
             self.pos += 2;
             return Ok(AtomExpr::AliphaticElement(35));
         }
-        let b = self.peek().ok_or_else(|| self.err("unexpected end of SMARTS"))?;
+        let b = self
+            .peek()
+            .ok_or_else(|| self.err("unexpected end of SMARTS"))?;
         self.pos += 1;
         match b {
             b'*' => Ok(AtomExpr::True),

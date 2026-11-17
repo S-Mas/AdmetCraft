@@ -8,12 +8,12 @@ pub mod sandbox;
 use std::path::{Path, PathBuf};
 
 use admet_calc::{MoleculeEvaluation, evaluate_batch};
-use admet_report::{ExportFormat, ReportError, write_report_file};
+use admet_report::{ExportFormat, ReportError, write_report_file, write_report_to_writer};
 use chem_core::{ChemError, Molecule, parse_csv_batch, parse_sdf, parse_smiles_batch};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use sandbox::{PathSandbox, SandboxError};
+pub use sandbox::{MAX_READ_BYTES, PathSandbox, SandboxError};
 
 /// Errors produced by `admet-engine`.
 #[derive(Debug, Error)]
@@ -237,7 +237,10 @@ impl CommandRegistry {
     }
 
     /// Execute `cmd` against `session`.
-    pub fn execute(session: &mut AdmetSession, cmd: Command) -> Result<CommandOutcome, EngineError> {
+    pub fn execute(
+        session: &mut AdmetSession,
+        cmd: Command,
+    ) -> Result<CommandOutcome, EngineError> {
         match cmd {
             Command::EvaluateBatchText { input } => {
                 session.push_undo();
@@ -389,10 +392,7 @@ impl CommandRegistry {
                 })
             }
             Command::Undo => {
-                let prev = session
-                    .undo_stack
-                    .pop()
-                    .ok_or(EngineError::NothingToUndo)?;
+                let prev = session.undo_stack.pop().ok_or(EngineError::NothingToUndo)?;
                 let current = session.snapshot();
                 session.redo_stack.push(current);
                 session.restore(prev);
@@ -403,10 +403,7 @@ impl CommandRegistry {
                 })
             }
             Command::Redo => {
-                let next = session
-                    .redo_stack
-                    .pop()
-                    .ok_or(EngineError::NothingToRedo)?;
+                let next = session.redo_stack.pop().ok_or(EngineError::NothingToRedo)?;
                 let current = session.snapshot();
                 session.undo_stack.push(current);
                 session.restore(next);
@@ -419,19 +416,25 @@ impl CommandRegistry {
         }
     }
 
-    /// Export session evaluations safely using optional `PathSandbox`.
+    /// Export session evaluations safely using optional `PathSandbox` (atomically via `open_write`
+    /// when sandboxed to eliminate path TOCTOU races).
     pub fn export_session(
         session: &AdmetSession,
         path: &Path,
         format: ExportFormat,
         sandbox: Option<&PathSandbox>,
     ) -> Result<PathBuf, EngineError> {
-        let resolved = match sandbox {
-            Some(sb) => sb.resolve_write(path)?,
-            None => path.to_path_buf(),
-        };
-        write_report_file(&session.evaluations, &resolved, format)?;
-        Ok(resolved)
+        match sandbox {
+            Some(sb) => {
+                let (resolved, mut file) = sb.open_write(path)?;
+                write_report_to_writer(&session.evaluations, &mut file, format)?;
+                Ok(resolved)
+            }
+            None => {
+                write_report_file(&session.evaluations, path, format)?;
+                Ok(path.to_path_buf())
+            }
+        }
     }
 }
 
@@ -487,22 +490,78 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_rejects_escape_paths() -> Result<(), Box<dyn std::error::Error>> {
-        let base = std::env::temp_dir().join("admetcraft_sb_test");
+    fn sandbox_rejects_escape_paths_dangling_symlinks_and_fifos()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("admetcraft_sb_test_p0");
+        let _ = std::fs::remove_dir_all(&base);
         let read_dir = base.join("read");
         let write_dir = base.join("write");
+        let secret_dir = base.join("secret");
         std::fs::create_dir_all(&read_dir)?;
         std::fs::create_dir_all(&write_dir)?;
+        std::fs::create_dir_all(&secret_dir)?;
+
         let inside_file = read_dir.join("ok.smi");
         std::fs::write(&inside_file, "CCO Ethanol\n")?;
 
         let sb = PathSandbox::new(Some(&read_dir), Some(&write_dir))?;
-        assert!(sb.resolve_read(Path::new("ok.smi")).is_ok());
-        assert!(sb.resolve_read(Path::new("../write")).is_err());
-        assert!(sb.resolve_write(Path::new("out.csv")).is_ok());
-        assert!(sb.resolve_write(Path::new("../read/evil.csv")).is_err());
+        assert!(sb.open_read(Path::new("ok.smi")).is_ok());
+        assert!(sb.open_read(Path::new("../write")).is_err());
+
+        let (wp, mut wf) = sb.open_write(Path::new("out.csv"))?;
+        use std::io::Write;
+        wf.write_all(b"ok")?;
+        assert!(wp.starts_with(std::fs::canonicalize(&write_dir)?));
+        assert!(sb.open_write(Path::new("../read/evil.csv")).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // 1. Dangling symlink inside write_root pointing outside -> MUST be rejected!
+            let dangling = write_dir.join("dangling_out.csv");
+            symlink(secret_dir.join("pwned.csv"), &dangling)?;
+            assert!(matches!(
+                sb.open_write(Path::new("dangling_out.csv")),
+                Err(SandboxError::SymlinkNotAllowed(_))
+            ));
+            assert!(!secret_dir.join("pwned.csv").exists());
+
+            // 2. Symlinked directory inside write_root pointing outside -> MUST be rejected!
+            let sym_dir = write_dir.join("linked_dir");
+            symlink(&secret_dir, &sym_dir)?;
+            assert!(matches!(
+                sb.open_write(Path::new("linked_dir/evil.csv")),
+                Err(SandboxError::SymlinkNotAllowed(_))
+            ));
+            assert!(!secret_dir.join("evil.csv").exists());
+
+            // 3. Symlink inside read_root pointing outside -> MUST be rejected!
+            let read_sym = read_dir.join("leak.smi");
+            std::fs::write(secret_dir.join("secret.smi"), "CCO Secret\n")?;
+            symlink(secret_dir.join("secret.smi"), &read_sym)?;
+            assert!(sb.open_read(Path::new("leak.smi")).is_err());
+
+            // 4. FIFO inside read_root -> MUST be rejected immediately without blocking!
+            let fifo_path = read_dir.join("pipe.smi");
+            let c_path = std::ffi::CString::new(fifo_path.to_string_lossy().as_bytes())?;
+            let mk_rc = unsafe_free_mkfifo(&c_path)?;
+            assert_eq!(mk_rc, 0);
+            assert!(matches!(
+                sb.open_read(Path::new("pipe.smi")),
+                Err(SandboxError::NotARegularFile(_))
+            ));
+        }
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn unsafe_free_mkfifo(path: &std::ffi::CStr) -> Result<i32, Box<dyn std::error::Error>> {
+        // Call system `mkfifo` binary so we preserve #![forbid(unsafe_code)]!
+        let status = std::process::Command::new("mkfifo")
+            .arg(path.to_str()?)
+            .status()?;
+        Ok(status.code().unwrap_or(1))
     }
 }

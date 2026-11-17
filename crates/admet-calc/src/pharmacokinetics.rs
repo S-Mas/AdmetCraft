@@ -1,7 +1,9 @@
 use chem_core::{BondOrder, Molecule};
 
 use crate::physicochem::round2;
-use crate::types::{AbsorptionLevel, BoiledEggPoint, Lipophilicity, Pharmacokinetics, PhysicochemicalProperties};
+use crate::types::{
+    AbsorptionLevel, BoiledEggPoint, Lipophilicity, Pharmacokinetics, PhysicochemicalProperties,
+};
 
 /// Daina & Zoete (2016) BOILED-Egg White (GI) ellipse center and rotated semi-axes.
 /// Exposed publicly so `admet-report` and `admetcraft` GUI render the exact same mathematical ellipses.
@@ -51,8 +53,7 @@ pub fn compute_boiled_egg(
         BOILED_EGG_YOLK_AXES,
         BOILED_EGG_YOLK_ANGLE_RAD,
     );
-    let in_plot_bounds =
-        (0.0..=200.0).contains(&phys.tpsa) && (-4.0..=8.0).contains(&lipo.wlogp);
+    let in_plot_bounds = (0.0..=200.0).contains(&phys.tpsa) && (-4.0..=8.0).contains(&lipo.wlogp);
 
     BoiledEggPoint {
         tpsa: phys.tpsa,
@@ -132,6 +133,7 @@ pub fn compute_pharmacokinetics(
         cyp2d6_inhibitor: cyp2d6,
         cyp3a4_inhibitor: cyp3a4,
         log_kp_cm_s: log_kp,
+        pgp_cyp_are_experimental_heuristics: true,
     };
     (pk, egg)
 }
@@ -143,9 +145,13 @@ fn predict_pgp_substrate(
 ) -> bool {
     let has_basic_amine = has_aliphatic_amine(mol);
     // Classical P-gp substrate profile: high MW / high HBA+HBD / cationic amphiphile or macro/polycyclic
-    let high_polar_size = phys.molecular_weight >= 400.0 && (phys.h_bond_acceptors + phys.h_bond_donors) >= 5;
-    let basic_amphiphile = has_basic_amine && phys.molecular_weight >= 275.0 && (phys.h_bond_donors >= 1 || lipo.consensus_log_p >= 2.0);
-    let zwitterion_fluoroquinolone = has_basic_amine && has_carboxylic_or_sulfonic_acid(mol) && phys.molecular_weight >= 280.0;
+    let high_polar_size =
+        phys.molecular_weight >= 400.0 && (phys.h_bond_acceptors + phys.h_bond_donors) >= 5;
+    let basic_amphiphile = has_basic_amine
+        && phys.molecular_weight >= 275.0
+        && (phys.h_bond_donors >= 1 || lipo.consensus_log_p >= 2.0);
+    let zwitterion_fluoroquinolone =
+        has_basic_amine && has_carboxylic_or_sulfonic_acid(mol) && phys.molecular_weight >= 280.0;
     high_polar_size || basic_amphiphile || zwitterion_fluoroquinolone
 }
 

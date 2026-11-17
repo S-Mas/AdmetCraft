@@ -29,7 +29,10 @@ fn pains_rules() -> &'static [CompiledRule] {
     PAINS_RULES.get_or_init(|| {
         compile_rules(&[
             // PAINS Family A
-            ("rhodanine_A", "[#6]1(=[O,S])[#7][#6](=[O,S])[#16][#6]1=[#6]"),
+            (
+                "rhodanine_A",
+                "[#6]1(=[O,S])[#7][#6](=[O,S])[#16][#6]1=[#6]",
+            ),
             ("quinone_A", "O=C1C=CC(=O)C=C1"),
             ("quinone_12_A", "O=C1C(=O)C=CC=C1"),
             ("catechol_A", "c1ccc(O)c(O)c1"),
@@ -42,7 +45,10 @@ fn pains_rules() -> &'static [CompiledRule] {
             ("hydroxyphenyl_hydrazone_A", "c1ccc(O)c(C=NN)c1"),
             ("toxoflavin_A", "O=c1[nH]c(=O)n2ncnc2n1"),
             // PAINS Family B
-            ("ene_five_het_B", "[#6]1(=[#6])[#6](=O)[#7][#6](=[O,S])[#16,#7,#8]1"),
+            (
+                "ene_five_het_B",
+                "[#6]1(=[#6])[#6](=O)[#7][#6](=[O,S])[#16,#7,#8]1",
+            ),
             ("imine_one_isatin_B", "O=C1Nc2ccccc2C1=N"),
             ("thioamide_ene_B", "[#6]=[#6][#6](=S)[#7]"),
             ("het_pyridinium_B", "c1cc[n+]([#6])cc1"),
@@ -94,7 +100,12 @@ fn brenk_rules() -> &'static [CompiledRule] {
     })
 }
 
-/// Compute PAINS alerts, Brenk alerts, Leadlikeness, and Synthetic Accessibility (1..=10).
+/// Number of curated PAINS SMARTS filters implemented (subset of Baell & Holloway ~480).
+pub const PAINS_CATALOG_SIZE: usize = 26;
+/// Number of curated Brenk SMARTS filters implemented (subset of Brenk et al. ~105).
+pub const BRENK_CATALOG_SIZE: usize = 25;
+
+/// Compute PAINS alerts, Brenk alerts, Leadlikeness, and heuristic Synthetic Accessibility (1..=10).
 pub fn compute_medicinal_chemistry(
     mol: &Molecule,
     phys: &PhysicochemicalProperties,
@@ -117,9 +128,12 @@ pub fn compute_medicinal_chemistry(
 
     MedicinalChemistry {
         pains_alerts,
+        pains_catalog_size: pains_rules().len(),
         brenk_alerts,
+        brenk_catalog_size: brenk_rules().len(),
         leadlikeness,
         synthetic_accessibility,
+        sa_is_heuristic_proxy: true,
     }
 }
 
@@ -144,12 +158,14 @@ fn eval_leadlikeness(phys: &PhysicochemicalProperties, lipo: &Lipophilicity) -> 
     }
 }
 
-/// Ertl & Schuffenhauer (2009) *J. Cheminf.* 1:8 Synthetic Accessibility Score (1.0 easy .. 10.0 hard).
+/// Heuristic Synthetic Accessibility proxy (1.0 easy .. 10.0 hard).
+/// Note: calibrated topological/fragment-diversity proxy; does not embed the 13M PubChem fragment
+/// frequency table from Ertl & Schuffenhauer (2009).
 pub fn compute_sa_score(mol: &Molecule) -> f64 {
     let heavy = mol.heavy_atom_count().max(1);
     let n_atoms = heavy as f64;
 
-    // 1. Fragment commonality proxy from circular 1-bond environments (ECFP2-like)
+    // 1. Local environment diversity above simple small-molecule baseline
     let mut env_signatures: BTreeSet<(u8, usize, bool, u8)> = BTreeSet::new();
     let mut uncommon_count = 0usize;
     for (idx, a) in mol.atoms.iter().enumerate() {
@@ -158,20 +174,21 @@ pub fn compute_sa_score(mol: &Molecule) -> f64 {
         }
         let deg = mol.heavy_degree(idx);
         env_signatures.insert((a.atomic_number, deg, a.aromatic, a.total_h()));
-        if !matches!(a.atomic_number, 6 | 7 | 8 | 9 | 16 | 17) || deg >= 4 && a.in_ring {
+        if !matches!(a.atomic_number, 6 | 7 | 8 | 9 | 16 | 17) || (deg >= 4 && a.in_ring) {
             uncommon_count += 1;
         }
     }
-    let diversity_ratio = env_signatures.len() as f64 / n_atoms;
+    let excess_envs = (env_signatures.len() as f64 - 4.0).max(0.0);
+    let complexity_ratio = excess_envs / n_atoms;
 
-    // 2. Topological complexity penalties (Ertl & Schuffenhauer 2009)
+    // 2. Topological complexity penalties
     let size_penalty = if n_atoms > 12.0 {
-        (n_atoms.powf(1.005) - n_atoms) + 0.04 * (n_atoms - 12.0)
+        0.042 * (n_atoms - 12.0)
     } else {
         0.0
     };
 
-    // Chiral centers (explicit tetrahedral tags + stereogenic sp3 C with >=3 distinct heavy nbrs)
+    // Chiral centers (explicit tetrahedral tags + stereogenic ring junctions)
     let stereo_centers = mol
         .atoms
         .iter()
@@ -185,7 +202,7 @@ pub fn compute_sa_score(mol: &Molecule) -> f64 {
                     && mol.rings.iter().filter(|r| r.contains(&idx)).count() >= 2)
         })
         .count() as f64;
-    let stereo_penalty = (stereo_centers + 1.0).ln() * 0.65;
+    let stereo_penalty = (stereo_centers + 1.0).ln() * 0.55;
 
     // Ring bridgehead & spiro complexity (atoms shared by >= 2 rings)
     let mut ring_shared_atoms = 0usize;
@@ -204,27 +221,15 @@ pub fn compute_sa_score(mol: &Molecule) -> f64 {
     } else {
         0.15 * (ring_shared_atoms as f64)
     };
-    let spiro_penalty = 0.50 * (spiro_atoms as f64);
+    let spiro_penalty = 0.45 * (spiro_atoms as f64);
 
-    // Macrocycle penalty (rings > 8 atoms)
-    let macro_penalty = mol
-        .rings
-        .iter()
-        .filter(|r| r.len() > 8)
-        .count() as f64
-        * 0.8;
+    // Macrocycle & strained 3/4-membered ring penalties
+    let macro_penalty = mol.rings.iter().filter(|r| r.len() > 8).count() as f64 * 0.65;
+    let strained_penalty = mol.rings.iter().filter(|r| r.len() <= 4).count() as f64 * 0.45;
 
-    // Small strained ring penalty (3- or 4-membered rings like cyclopropyl, beta-lactam)
-    let strained_penalty = mol
-        .rings
-        .iter()
-        .filter(|r| r.len() <= 4)
-        .count() as f64
-        * 0.55;
-
-    let raw = 1.05
-        + 0.95 * diversity_ratio
-        + 0.25 * (uncommon_count as f64)
+    let raw = 1.0
+        + 0.85 * complexity_ratio
+        + 0.20 * (uncommon_count as f64)
         + size_penalty
         + stereo_penalty
         + bridge_penalty

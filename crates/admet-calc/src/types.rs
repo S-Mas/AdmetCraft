@@ -1,3 +1,5 @@
+use std::f64::consts::PI;
+
 use serde::{Deserialize, Serialize};
 
 /// Gastrointestinal passive absorption class.
@@ -8,7 +10,7 @@ pub enum AbsorptionLevel {
 }
 
 impl AbsorptionLevel {
-    /// SwissADME display label.
+    /// Display label.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::High => "High",
@@ -17,7 +19,7 @@ impl AbsorptionLevel {
     }
 }
 
-/// Qualitative aqueous solubility class (SwissADME scale).
+/// Qualitative aqueous solubility class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SolubilityClass {
     Insoluble,
@@ -46,7 +48,7 @@ impl SolubilityClass {
         }
     }
 
-    /// SwissADME display label.
+    /// Display label.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Insoluble => "Insoluble",
@@ -59,7 +61,7 @@ impl SolubilityClass {
     }
 }
 
-/// Physicochemical descriptors section (SwissADME parity).
+/// Physicochemical descriptors section.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhysicochemicalProperties {
     pub formula: String,
@@ -74,14 +76,21 @@ pub struct PhysicochemicalProperties {
     pub tpsa: f64,
 }
 
-/// Lipophilicity predictions across 5 models plus consensus average.
+/// Lipophilicity predictions: 3 distinct models (`XLOGP3`-heuristic, `WLOGP`, `MLOGP`),
+/// their arithmetic mean (`consensus_log_p`), plus 2 clearly labeled experimental linear surrogates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lipophilicity {
-    pub ilogp: f64,
-    pub xlogp3: f64,
+    /// Wildman & Crippen (1999) atomic logP.
     pub wlogp: f64,
+    /// Atom-additive logP heuristic inspired by Cheng et al. (2007).
+    pub xlogp3: f64,
+    /// Moriguchi et al. (1992) topological logP.
     pub mlogp: f64,
-    pub silicos_it: f64,
+    /// Experimental solvation-inspired linear heuristic (NOT SwissADME iLOGP).
+    pub solvation_logp_est: f64,
+    /// Experimental topological linear heuristic (NOT Silicos-IT).
+    pub topological_logp_est: f64,
+    /// Arithmetic mean of the 3 primary models (`wlogp`, `xlogp3`, `mlogp`).
     pub consensus_log_p: f64,
 }
 
@@ -94,26 +103,35 @@ pub struct WaterSolubilityModel {
     pub class: SolubilityClass,
 }
 
-/// Water solubility section (ESOL, Ali, Silicos-IT).
+/// Water solubility section (ESOL, Ali, and an experimental topological heuristic).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WaterSolubility {
     pub esol: WaterSolubilityModel,
     pub ali: WaterSolubilityModel,
-    pub silicos_it: WaterSolubilityModel,
+    pub topological_est: WaterSolubilityModel,
 }
 
 /// Pharmacokinetics (ADME) predictions.
+/// Note: GI/BBB use the BOILED-Egg ellipses and log Kp uses Potts & Guy (1992);
+/// P-gp substrate and CYP450 flags are experimental rule-based heuristics (not trained SVMs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pharmacokinetics {
     pub gi_absorption: AbsorptionLevel,
     pub bbb_permeant: bool,
+    /// Experimental heuristic P-gp substrate flag.
     pub pgp_substrate: bool,
+    /// Experimental heuristic CYP1A2 inhibitor flag.
     pub cyp1a2_inhibitor: bool,
+    /// Experimental heuristic CYP2C19 inhibitor flag.
     pub cyp2c19_inhibitor: bool,
+    /// Experimental heuristic CYP2C9 inhibitor flag.
     pub cyp2c9_inhibitor: bool,
+    /// Experimental heuristic CYP2D6 inhibitor flag.
     pub cyp2d6_inhibitor: bool,
+    /// Experimental heuristic CYP3A4 inhibitor flag.
     pub cyp3a4_inhibitor: bool,
     pub log_kp_cm_s: f64,
+    pub pgp_cyp_are_experimental_heuristics: bool,
 }
 
 /// Outcome of a druglikeness / leadlikeness rule filter.
@@ -139,9 +157,15 @@ pub struct Druglikeness {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MedicinalChemistry {
     pub pains_alerts: Vec<String>,
+    /// Number of curated PAINS SMARTS checked (subset of Baell & Holloway ~480 catalog).
+    pub pains_catalog_size: usize,
     pub brenk_alerts: Vec<String>,
+    /// Number of curated Brenk SMARTS checked (subset of Brenk et al. ~105 catalog).
+    pub brenk_catalog_size: usize,
     pub leadlikeness: RuleResult,
+    /// Heuristic Synthetic Accessibility proxy in `[1.0, 10.0]` (does not include PubChem fragment table).
     pub synthetic_accessibility: f64,
+    pub sa_is_heuristic_proxy: bool,
 }
 
 /// BOILED-Egg coordinate and region classification.
@@ -153,6 +177,33 @@ pub struct BoiledEggPoint {
     pub in_yolk: bool,
     pub pgp_substrate: bool,
     pub in_plot_bounds: bool,
+}
+
+/// Shared geometry sampler for BOILED-Egg ellipses across PDF, SVG, and GUI renderers.
+pub struct BoiledEggGeometry;
+
+impl BoiledEggGeometry {
+    /// Sample points in `(tpsa, wlogp)` coordinates along a rotated ellipse.
+    pub fn sample_ellipse(
+        center: (f64, f64),
+        axes: (f64, f64),
+        angle_rad: f64,
+        steps: usize,
+    ) -> Vec<(f64, f64)> {
+        let cos_a = angle_rad.cos();
+        let sin_a = angle_rad.sin();
+        (0..steps)
+            .map(|i| {
+                let t = 2.0 * PI * (i as f64) / (steps as f64);
+                let lx = axes.0 * t.cos();
+                let ly = axes.1 * t.sin();
+                (
+                    center.0 + lx * cos_a - ly * sin_a,
+                    center.1 + lx * sin_a + ly * cos_a,
+                )
+            })
+            .collect()
+    }
 }
 
 /// Six-axis Bioavailability Radar descriptors and normalized values `[0, 1]` where `[0.25, 0.85]`
@@ -167,8 +218,35 @@ pub struct BioavailabilityRadar {
     pub flex_rot_bonds: usize,
     /// Normalized axis scores `[0.0, 1.0]` in order `[LIPO, SIZE, POLAR, INSOLU, INSATU, FLEX]`.
     pub normalized_axes: [f64; 6],
-    /// True if all 6 axes lie inside the SwissADME pink optimal zone.
+    /// True if all 6 axes lie inside the optimal physicochemical zone.
     pub all_in_optimal_zone: bool,
+}
+
+impl BioavailabilityRadar {
+    /// Axis labels in clockwise order starting at 12 o'clock.
+    pub const AXIS_LABELS: [&'static str; 6] =
+        ["LIPO", "SIZE", "POLAR", "INSOLU", "INSATU", "FLEX"];
+
+    /// Compute normalized unit-circle `(x, y)` coordinates (`x` right, `y` up) for a hexagon at `radius`.
+    pub fn unit_hexagon(radius: f64) -> [(f64, f64); 6] {
+        let mut pts = [(0.0, 0.0); 6];
+        for (i, slot) in pts.iter_mut().enumerate() {
+            let ang = PI / 2.0 - (i as f64) * PI / 3.0;
+            *slot = (radius * ang.cos(), radius * ang.sin());
+        }
+        pts
+    }
+
+    /// Compute normalized `(x, y)` coordinates (`x` right, `y` up) for this molecule's radar polygon.
+    pub fn unit_polygon(&self) -> [(f64, f64); 6] {
+        let mut pts = [(0.0, 0.0); 6];
+        for (i, (&val, slot)) in self.normalized_axes.iter().zip(pts.iter_mut()).enumerate() {
+            let ang = PI / 2.0 - (i as f64) * PI / 3.0;
+            let r = val.clamp(0.05, 1.0);
+            *slot = (r * ang.cos(), r * ang.sin());
+        }
+        pts
+    }
 }
 
 /// Complete ADMET evaluation for one molecule.
@@ -177,6 +255,8 @@ pub struct MoleculeEvaluation {
     pub name: String,
     pub input_smiles: String,
     pub canonical_smiles: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub physicochemical: PhysicochemicalProperties,
     pub lipophilicity: Lipophilicity,
     pub water_solubility: WaterSolubility,

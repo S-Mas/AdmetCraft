@@ -2,7 +2,8 @@ use chem_core::Molecule;
 
 use crate::physicochem::round2;
 use crate::types::{
-    Lipophilicity, PhysicochemicalProperties, SolubilityClass, WaterSolubility, WaterSolubilityModel,
+    Lipophilicity, PhysicochemicalProperties, SolubilityClass, WaterSolubility,
+    WaterSolubilityModel,
 };
 
 /// Compute ESOL (Delaney 2004), Ali (2012), and SILICOS-IT water solubility predictions.
@@ -17,25 +18,23 @@ pub fn compute_water_solubility(
     } else {
         phys.aromatic_heavy_atoms as f64 / phys.heavy_atoms as f64
     };
-    let esol_log_s = 0.16
-        - 0.63 * lipo.xlogp3
-        - 0.0062 * phys.molecular_weight
+    let esol_log_s = 0.16 - 0.63 * lipo.xlogp3 - 0.0062 * phys.molecular_weight
         + 0.066 * (phys.rotatable_bonds as f64)
         - 0.74 * ap;
 
     // 2. Ali et al. (2012): log S = 0.514 - 1.038*LogP - 0.0062*TPSA (adapted with XLOGP3)
     let ali_log_s = 0.514 - 1.038 * lipo.xlogp3 - 0.0062 * phys.tpsa;
 
-    // 3. SILICOS-IT Log S
+    // 3. Experimental topological solubility heuristic (NOT Silicos-IT)
     let rings = mol.rings.len() as f64;
-    let silicos_log_s = 0.40 - 0.85 * lipo.silicos_it - 0.0050 * phys.molecular_weight
+    let topo_log_s = 0.40 - 0.85 * lipo.topological_logp_est - 0.0050 * phys.molecular_weight
         + 0.010 * phys.tpsa
         - 0.25 * rings;
 
     WaterSolubility {
         esol: build_model(esol_log_s, phys.molecular_weight),
         ali: build_model(ali_log_s, phys.molecular_weight),
-        silicos_it: build_model(silicos_log_s, phys.molecular_weight),
+        topological_est: build_model(topo_log_s, phys.molecular_weight),
     }
 }
 

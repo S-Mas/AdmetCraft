@@ -1,11 +1,11 @@
 use std::f64::consts::PI;
 use std::fmt::Write as _;
 
-use admet_calc::MoleculeEvaluation;
 use admet_calc::pharmacokinetics::{
     BOILED_EGG_WHITE_ANGLE_RAD, BOILED_EGG_WHITE_AXES, BOILED_EGG_WHITE_CENTER,
     BOILED_EGG_YOLK_ANGLE_RAD, BOILED_EGG_YOLK_AXES, BOILED_EGG_YOLK_CENTER,
 };
+use admet_calc::{BioavailabilityRadar, BoiledEggGeometry, MoleculeEvaluation};
 use chem_core::{BondOrder, ensure_2d_coords, parse_smiles};
 
 use crate::ReportError;
@@ -13,14 +13,29 @@ use crate::ReportError;
 const PAGE_W: f64 = 595.0;
 const PAGE_H: f64 = 842.0;
 
-/// Generate a publication-ready multi-page PDF 1.4 report in pure Rust.
+/// Generate a publication-ready multi-page PDF 1.4 report in pure Rust with WinAnsiEncoding
+/// and complete paginated summary tables (no molecules dropped).
 pub fn export_pdf_bytes(evals: &[MoleculeEvaluation]) -> Result<Vec<u8>, ReportError> {
     if evals.is_empty() {
         return Err(ReportError::EmptyReport);
     }
 
     let mut page_streams: Vec<String> = Vec::new();
-    page_streams.push(build_summary_page(evals));
+    // Page 1 holds header + up to 24 summary rows + BOILED-Egg plot; overflow rows paginate cleanly
+    let first_chunk = evals.len().min(24);
+    page_streams.push(build_summary_first_page(evals, &evals[..first_chunk]));
+
+    let mut offset = first_chunk;
+    while offset < evals.len() {
+        let end = (offset + 44).min(evals.len());
+        page_streams.push(build_summary_cont_page(
+            &evals[offset..end],
+            offset + 1,
+            evals.len(),
+        ));
+        offset = end;
+    }
+
     for eval in evals {
         page_streams.push(build_molecule_page(eval));
     }
@@ -28,18 +43,147 @@ pub fn export_pdf_bytes(evals: &[MoleculeEvaluation]) -> Result<Vec<u8>, ReportE
     Ok(assemble_pdf(&page_streams))
 }
 
-fn build_summary_page(evals: &[MoleculeEvaluation]) -> String {
+fn draw_summary_table_header(s: &mut String, y: f64) -> f64 {
+    draw_rect_fill(s, 40.0, y - 4.0, 515.0, 16.0, (0.92, 0.92, 0.94));
+    draw_text(s, "F2", 8.0, 44.0, y, (0.1, 0.1, 0.1), "Molecule");
+    draw_text(s, "F2", 8.0, 155.0, y, (0.1, 0.1, 0.1), "Formula");
+    draw_text(s, "F2", 8.0, 225.0, y, (0.1, 0.1, 0.1), "MW");
+    draw_text(s, "F2", 8.0, 270.0, y, (0.1, 0.1, 0.1), "TPSA");
+    draw_text(s, "F2", 8.0, 315.0, y, (0.1, 0.1, 0.1), "cLogP");
+    draw_text(s, "F2", 8.0, 360.0, y, (0.1, 0.1, 0.1), "ESOL");
+    draw_text(s, "F2", 8.0, 405.0, y, (0.1, 0.1, 0.1), "GI");
+    draw_text(s, "F2", 8.0, 442.0, y, (0.1, 0.1, 0.1), "BBB");
+    draw_text(s, "F2", 8.0, 478.0, y, (0.1, 0.1, 0.1), "Lipinski");
+    draw_text(s, "F2", 8.0, 525.0, y, (0.1, 0.1, 0.1), "SA");
+    y - 15.0
+}
+
+fn draw_summary_rows(s: &mut String, rows: &[MoleculeEvaluation], mut y: f64) -> f64 {
+    for (idx, e) in rows.iter().enumerate() {
+        if idx % 2 == 1 {
+            draw_rect_fill(s, 40.0, y - 3.0, 515.0, 13.0, (0.97, 0.97, 0.98));
+        }
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            44.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &truncate(&e.name, 20),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            155.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &truncate(&e.physicochemical.formula, 12),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            225.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &format!("{:.1}", e.physicochemical.molecular_weight),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            270.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &format!("{:.1}", e.physicochemical.tpsa),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            315.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &format!("{:.2}", e.lipophilicity.consensus_log_p),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            360.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &format!("{:.2}", e.water_solubility.esol.log_s),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            405.0,
+            y,
+            (0.1, 0.1, 0.1),
+            e.pharmacokinetics.gi_absorption.as_str(),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            442.0,
+            y,
+            (0.1, 0.1, 0.1),
+            if e.pharmacokinetics.bbb_permeant {
+                "Yes"
+            } else {
+                "No"
+            },
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            478.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &format!(
+                "{} ({})",
+                if e.druglikeness.lipinski.pass {
+                    "Yes"
+                } else {
+                    "No"
+                },
+                e.druglikeness.lipinski.violations
+            ),
+        );
+        draw_text(
+            s,
+            "F1",
+            8.0,
+            525.0,
+            y,
+            (0.1, 0.1, 0.1),
+            &format!("{:.2}", e.medicinal_chemistry.synthetic_accessibility),
+        );
+        y -= 13.0;
+    }
+    y
+}
+
+fn build_summary_first_page(
+    all_evals: &[MoleculeEvaluation],
+    first_rows: &[MoleculeEvaluation],
+) -> String {
     let mut s = String::new();
-    // Header banner
     draw_rect_fill(&mut s, 0.0, PAGE_H - 64.0, PAGE_W, 64.0, (0.22, 0.22, 0.24));
     draw_text(
         &mut s,
         "F2",
-        18.0,
+        17.0,
         40.0,
         PAGE_H - 36.0,
         (1.0, 1.0, 1.0),
-        "AdmetCraft  |  SwissADME-Compatible ADMET Report",
+        "AdmetCraft  |  Local-First ADMET Report",
     );
     draw_text(
         &mut s,
@@ -48,94 +192,132 @@ fn build_summary_page(evals: &[MoleculeEvaluation]) -> String {
         40.0,
         PAGE_H - 52.0,
         (0.85, 0.85, 0.85),
-        &format!("Local-First Pure-Rust Report  |  {} molecule(s) evaluated", evals.len()),
+        &format!(
+            "Pure-Rust Cheminformatics  |  {} molecule(s) evaluated (rows 1..{} shown below)",
+            all_evals.len(),
+            first_rows.len()
+        ),
     );
 
-    // Summary table
     let mut y = PAGE_H - 92.0;
-    draw_text(&mut s, "F2", 11.5, 40.0, y, (0.15, 0.15, 0.15), "Summary Table");
+    draw_text(
+        &mut s,
+        "F2",
+        11.5,
+        40.0,
+        y,
+        (0.15, 0.15, 0.15),
+        "Summary Table",
+    );
     y -= 16.0;
-    draw_rect_fill(&mut s, 40.0, y - 4.0, 515.0, 16.0, (0.92, 0.92, 0.94));
-    draw_text(&mut s, "F2", 8.0, 44.0, y, (0.1, 0.1, 0.1), "Molecule");
-    draw_text(&mut s, "F2", 8.0, 155.0, y, (0.1, 0.1, 0.1), "Formula");
-    draw_text(&mut s, "F2", 8.0, 225.0, y, (0.1, 0.1, 0.1), "MW");
-    draw_text(&mut s, "F2", 8.0, 270.0, y, (0.1, 0.1, 0.1), "TPSA");
-    draw_text(&mut s, "F2", 8.0, 315.0, y, (0.1, 0.1, 0.1), "cLogP");
-    draw_text(&mut s, "F2", 8.0, 360.0, y, (0.1, 0.1, 0.1), "ESOL");
-    draw_text(&mut s, "F2", 8.0, 405.0, y, (0.1, 0.1, 0.1), "GI");
-    draw_text(&mut s, "F2", 8.0, 442.0, y, (0.1, 0.1, 0.1), "BBB");
-    draw_text(&mut s, "F2", 8.0, 478.0, y, (0.1, 0.1, 0.1), "Lipinski");
-    draw_text(&mut s, "F2", 8.0, 525.0, y, (0.1, 0.1, 0.1), "SA");
-    y -= 15.0;
+    y = draw_summary_table_header(&mut s, y);
+    let _ = draw_summary_rows(&mut s, first_rows, y);
 
-    for (idx, e) in evals.iter().take(18).enumerate() {
-        if idx % 2 == 1 {
-            draw_rect_fill(&mut s, 40.0, y - 3.0, 515.0, 13.0, (0.97, 0.97, 0.98));
-        }
-        draw_text(&mut s, "F1", 8.0, 44.0, y, (0.1, 0.1, 0.1), &truncate(&e.name, 20));
-        draw_text(&mut s, "F1", 8.0, 155.0, y, (0.1, 0.1, 0.1), &truncate(&e.physicochemical.formula, 12));
-        draw_text(&mut s, "F1", 8.0, 225.0, y, (0.1, 0.1, 0.1), &format!("{:.1}", e.physicochemical.molecular_weight));
-        draw_text(&mut s, "F1", 8.0, 270.0, y, (0.1, 0.1, 0.1), &format!("{:.1}", e.physicochemical.tpsa));
-        draw_text(&mut s, "F1", 8.0, 315.0, y, (0.1, 0.1, 0.1), &format!("{:.2}", e.lipophilicity.consensus_log_p));
-        draw_text(&mut s, "F1", 8.0, 360.0, y, (0.1, 0.1, 0.1), &format!("{:.2}", e.water_solubility.esol.log_s));
-        draw_text(&mut s, "F1", 8.0, 405.0, y, (0.1, 0.1, 0.1), e.pharmacokinetics.gi_absorption.as_str());
-        draw_text(&mut s, "F1", 8.0, 442.0, y, (0.1, 0.1, 0.1), if e.pharmacokinetics.bbb_permeant { "Yes" } else { "No" });
-        draw_text(&mut s, "F1", 8.0, 478.0, y, (0.1, 0.1, 0.1), &format!("{} ({})", if e.druglikeness.lipinski.pass { "Yes" } else { "No" }, e.druglikeness.lipinski.violations));
-        draw_text(&mut s, "F1", 8.0, 525.0, y, (0.1, 0.1, 0.1), &format!("{:.2}", e.medicinal_chemistry.synthetic_accessibility));
-        y -= 13.0;
-    }
-
-    // BOILED-Egg vector plot on lower half of summary page
+    // BOILED-Egg vector plot on lower half of page 1 using shared BoiledEggGeometry
     let egg_x = 65.0;
     let egg_y = 75.0;
     let egg_w = 370.0;
     let egg_h = 250.0;
-    draw_text(&mut s, "F2", 11.5, 40.0, egg_y + egg_h + 20.0, (0.15, 0.15, 0.15), "BOILED-Egg (WLOGP vs TPSA)");
-    draw_rect_fill_stroke(&mut s, (egg_x, egg_y, egg_w, egg_h), (0.85, 0.85, 0.85), (0.35, 0.35, 0.35), 0.8);
+    draw_text(
+        &mut s,
+        "F2",
+        11.5,
+        40.0,
+        egg_y + egg_h + 20.0,
+        (0.15, 0.15, 0.15),
+        "BOILED-Egg (WLOGP vs TPSA)",
+    );
+    draw_rect_fill_stroke(
+        &mut s,
+        (egg_x, egg_y, egg_w, egg_h),
+        (0.85, 0.85, 0.85),
+        (0.35, 0.35, 0.35),
+        0.8,
+    );
 
-    let map_x = |tpsa: f64| egg_x + (tpsa / 200.0) * egg_w;
-    let map_y = |wlogp: f64| egg_y + ((wlogp + 4.0) / 12.0) * egg_h;
+    let map_x = |tpsa: f64| (egg_x + (tpsa / 200.0) * egg_w).clamp(egg_x, egg_x + egg_w);
+    let map_y = |wlogp: f64| (egg_y + ((wlogp + 4.0) / 12.0) * egg_h).clamp(egg_y, egg_y + egg_h);
 
-    let white_poly = sample_ellipse_pdf(
+    let white_poly: Vec<(f64, f64)> = BoiledEggGeometry::sample_ellipse(
         BOILED_EGG_WHITE_CENTER,
         BOILED_EGG_WHITE_AXES,
         BOILED_EGG_WHITE_ANGLE_RAD,
-        egg_x,
-        egg_x + egg_w,
-        egg_y,
-        egg_y + egg_h,
-        &map_x,
-        &map_y,
+        64,
+    )
+    .into_iter()
+    .map(|(x, y)| (map_x(x), map_y(y)))
+    .collect();
+    draw_polygon(
+        &mut s,
+        &white_poly,
+        Some((1.0, 1.0, 1.0)),
+        Some((0.5, 0.5, 0.5)),
+        0.8,
     );
-    draw_polygon(&mut s, &white_poly, Some((1.0, 1.0, 1.0)), Some((0.5, 0.5, 0.5)), 0.8);
 
-    let yolk_poly = sample_ellipse_pdf(
+    let yolk_poly: Vec<(f64, f64)> = BoiledEggGeometry::sample_ellipse(
         BOILED_EGG_YOLK_CENTER,
         BOILED_EGG_YOLK_AXES,
         BOILED_EGG_YOLK_ANGLE_RAD,
-        egg_x,
-        egg_x + egg_w,
-        egg_y,
-        egg_y + egg_h,
-        &map_x,
-        &map_y,
+        64,
+    )
+    .into_iter()
+    .map(|(x, y)| (map_x(x), map_y(y)))
+    .collect();
+    draw_polygon(
+        &mut s,
+        &yolk_poly,
+        Some((0.96, 0.77, 0.10)),
+        Some((0.75, 0.58, 0.0)),
+        0.8,
     );
-    draw_polygon(&mut s, &yolk_poly, Some((0.96, 0.77, 0.10)), Some((0.75, 0.58, 0.0)), 0.8);
 
     for t in [0, 50, 100, 150, 200] {
         let px = map_x(f64::from(t));
         draw_line(&mut s, px, egg_y, px, egg_y - 4.0, (0.3, 0.3, 0.3), 0.7);
-        draw_text(&mut s, "F1", 7.5, px - 6.0, egg_y - 13.0, (0.2, 0.2, 0.2), &t.to_string());
+        draw_text(
+            &mut s,
+            "F1",
+            7.5,
+            px - 6.0,
+            egg_y - 13.0,
+            (0.2, 0.2, 0.2),
+            &t.to_string(),
+        );
     }
     for lp in [-4, -2, 0, 2, 4, 6, 8] {
         let py = map_y(f64::from(lp));
         draw_line(&mut s, egg_x - 4.0, py, egg_x, py, (0.3, 0.3, 0.3), 0.7);
-        draw_text(&mut s, "F1", 7.5, egg_x - 18.0, py - 2.5, (0.2, 0.2, 0.2), &lp.to_string());
+        draw_text(
+            &mut s,
+            "F1",
+            7.5,
+            egg_x - 18.0,
+            py - 2.5,
+            (0.2, 0.2, 0.2),
+            &lp.to_string(),
+        );
     }
-    draw_text(&mut s, "F2", 8.5, egg_x + egg_w * 0.42, egg_y - 26.0, (0.15, 0.15, 0.15), "TPSA (A^2)");
-    draw_text(&mut s, "F2", 8.5, 22.0, egg_y + egg_h * 0.5, (0.15, 0.15, 0.15), "WLOGP");
+    draw_text(
+        &mut s,
+        "F2",
+        8.5,
+        egg_x + egg_w * 0.42,
+        egg_y - 26.0,
+        (0.15, 0.15, 0.15),
+        "TPSA (A^2)",
+    );
+    draw_text(
+        &mut s,
+        "F2",
+        8.5,
+        22.0,
+        egg_y + egg_h * 0.5,
+        (0.15, 0.15, 0.15),
+        "WLOGP",
+    );
 
-    for e in evals {
+    for e in all_evals {
         if !e.boiled_egg.in_plot_bounds {
             continue;
         }
@@ -147,28 +329,115 @@ fn build_summary_page(evals: &[MoleculeEvaluation]) -> String {
             (0.88, 0.19, 0.19)
         };
         draw_circle(&mut s, px, py, 3.2, col);
-        draw_text(&mut s, "F1", 6.5, px + 4.5, py - 2.0, (0.1, 0.1, 0.1), &truncate(&e.name, 14));
+        draw_text(
+            &mut s,
+            "F1",
+            6.5,
+            px + 4.5,
+            py - 2.0,
+            (0.1, 0.1, 0.1),
+            &truncate(&e.name, 14),
+        );
     }
 
-    // Legend box
     let lx = egg_x + egg_w + 15.0;
-    draw_rect_fill_stroke(&mut s, (lx, egg_y + 110.0, 105.0, 110.0), (0.98, 0.98, 0.98), (0.78, 0.78, 0.78), 0.6);
-    draw_rect_fill_stroke(&mut s, (lx + 8.0, egg_y + 195.0, 10.0, 10.0), (1.0, 1.0, 1.0), (0.5, 0.5, 0.5), 0.6);
-    draw_text(&mut s, "F1", 8.0, lx + 24.0, egg_y + 197.0, (0.1, 0.1, 0.1), "HIA (White)");
-    draw_rect_fill_stroke(&mut s, (lx + 8.0, egg_y + 175.0, 10.0, 10.0), (0.96, 0.77, 0.10), (0.75, 0.58, 0.0), 0.6);
-    draw_text(&mut s, "F1", 8.0, lx + 24.0, egg_y + 177.0, (0.1, 0.1, 0.1), "BBB (Yolk)");
+    draw_rect_fill_stroke(
+        &mut s,
+        (lx, egg_y + 110.0, 105.0, 110.0),
+        (0.98, 0.98, 0.98),
+        (0.78, 0.78, 0.78),
+        0.6,
+    );
+    draw_rect_fill_stroke(
+        &mut s,
+        (lx + 8.0, egg_y + 195.0, 10.0, 10.0),
+        (1.0, 1.0, 1.0),
+        (0.5, 0.5, 0.5),
+        0.6,
+    );
+    draw_text(
+        &mut s,
+        "F1",
+        8.0,
+        lx + 24.0,
+        egg_y + 197.0,
+        (0.1, 0.1, 0.1),
+        "HIA (White)",
+    );
+    draw_rect_fill_stroke(
+        &mut s,
+        (lx + 8.0, egg_y + 175.0, 10.0, 10.0),
+        (0.96, 0.77, 0.10),
+        (0.75, 0.58, 0.0),
+        0.6,
+    );
+    draw_text(
+        &mut s,
+        "F1",
+        8.0,
+        lx + 24.0,
+        egg_y + 177.0,
+        (0.1, 0.1, 0.1),
+        "BBB (Yolk)",
+    );
     draw_circle(&mut s, lx + 13.0, egg_y + 158.0, 3.5, (0.11, 0.49, 0.84));
-    draw_text(&mut s, "F1", 8.0, lx + 24.0, egg_y + 155.0, (0.1, 0.1, 0.1), "PGP+");
+    draw_text(
+        &mut s,
+        "F1",
+        8.0,
+        lx + 24.0,
+        egg_y + 155.0,
+        (0.1, 0.1, 0.1),
+        "PGP+",
+    );
     draw_circle(&mut s, lx + 13.0, egg_y + 138.0, 3.5, (0.88, 0.19, 0.19));
-    draw_text(&mut s, "F1", 8.0, lx + 24.0, egg_y + 135.0, (0.1, 0.1, 0.1), "PGP-");
+    draw_text(
+        &mut s,
+        "F1",
+        8.0,
+        lx + 24.0,
+        egg_y + 135.0,
+        (0.1, 0.1, 0.1),
+        "PGP-",
+    );
 
+    s
+}
+
+fn build_summary_cont_page(rows: &[MoleculeEvaluation], start_idx: usize, total: usize) -> String {
+    let mut s = String::new();
+    draw_rect_fill(&mut s, 0.0, PAGE_H - 44.0, PAGE_W, 44.0, (0.22, 0.22, 0.24));
+    draw_text(
+        &mut s,
+        "F2",
+        13.0,
+        40.0,
+        PAGE_H - 28.0,
+        (1.0, 1.0, 1.0),
+        &format!(
+            "Summary Table (continued: {}..{} of {})",
+            start_idx,
+            start_idx + rows.len() - 1,
+            total
+        ),
+    );
+    let y = draw_summary_table_header(&mut s, PAGE_H - 70.0);
+    let _ = draw_summary_rows(&mut s, rows, y);
     s
 }
 
 fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
     let mut s = String::new();
     draw_rect_fill(&mut s, 0.0, PAGE_H - 54.0, PAGE_W, 54.0, (0.24, 0.24, 0.27));
-    draw_text(&mut s, "F2", 15.0, 40.0, PAGE_H - 28.0, (1.0, 1.0, 1.0), &truncate(&eval.name, 52));
+    draw_text(
+        &mut s,
+        "F2",
+        15.0,
+        40.0,
+        PAGE_H - 28.0,
+        (1.0, 1.0, 1.0),
+        &truncate(&eval.name, 52),
+    );
     draw_text(
         &mut s,
         "F1",
@@ -179,16 +448,49 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
         &format!("SMILES: {}", truncate(&eval.canonical_smiles, 86)),
     );
 
-    // Top row: 2D Structure box (left) & Bioavailability Radar (right)
-    draw_rect_fill_stroke(&mut s, (40.0, PAGE_H - 250.0, 250.0, 180.0), (0.99, 0.99, 0.99), (0.82, 0.82, 0.82), 0.7);
-    draw_text(&mut s, "F2", 9.0, 48.0, PAGE_H - 83.0, (0.3, 0.3, 0.3), "2D Structure");
-    draw_2d_mol_pdf(&mut s, &eval.canonical_smiles, 48.0, PAGE_H - 242.0, 234.0, 150.0);
+    draw_rect_fill_stroke(
+        &mut s,
+        (40.0, PAGE_H - 250.0, 250.0, 180.0),
+        (0.99, 0.99, 0.99),
+        (0.82, 0.82, 0.82),
+        0.7,
+    );
+    draw_text(
+        &mut s,
+        "F2",
+        9.0,
+        48.0,
+        PAGE_H - 83.0,
+        (0.3, 0.3, 0.3),
+        "2D Structure",
+    );
+    draw_2d_mol_pdf(
+        &mut s,
+        &eval.canonical_smiles,
+        48.0,
+        PAGE_H - 242.0,
+        234.0,
+        150.0,
+    );
 
-    draw_rect_fill_stroke(&mut s, (305.0, PAGE_H - 250.0, 250.0, 180.0), (0.99, 0.99, 0.99), (0.82, 0.82, 0.82), 0.7);
-    draw_text(&mut s, "F2", 9.0, 313.0, PAGE_H - 83.0, (0.3, 0.3, 0.3), "Bioavailability Radar");
+    draw_rect_fill_stroke(
+        &mut s,
+        (305.0, PAGE_H - 250.0, 250.0, 180.0),
+        (0.99, 0.99, 0.99),
+        (0.82, 0.82, 0.82),
+        0.7,
+    );
+    draw_text(
+        &mut s,
+        "F2",
+        9.0,
+        313.0,
+        PAGE_H - 83.0,
+        (0.3, 0.3, 0.3),
+        "Bioavailability Radar",
+    );
     draw_radar_pdf(&mut s, eval, 430.0, PAGE_H - 165.0, 56.0);
 
-    // Two-column property cards
     let p = &eval.physicochemical;
     let l = &eval.lipophilicity;
     let w = &eval.water_solubility;
@@ -205,7 +507,10 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
         "Physicochemical Properties",
         &[
             ("Formula", p.formula.clone()),
-            ("Molecular weight", format!("{:.2} g/mol", p.molecular_weight)),
+            (
+                "Molecular weight",
+                format!("{:.2} g/mol", p.molecular_weight),
+            ),
             ("Num. heavy atoms", p.heavy_atoms.to_string()),
             ("Num. arom. heavy atoms", p.aromatic_heavy_atoms.to_string()),
             ("Fraction Csp3", format!("{:.2}", p.fraction_csp3)),
@@ -224,12 +529,15 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
         250.0,
         "Lipophilicity (Log Po/w)",
         &[
-            ("iLOGP", format!("{:.2}", l.ilogp)),
-            ("XLOGP3", format!("{:.2}", l.xlogp3)),
-            ("WLOGP", format!("{:.2}", l.wlogp)),
-            ("MLOGP", format!("{:.2}", l.mlogp)),
-            ("Silicos-IT Log P", format!("{:.2}", l.silicos_it)),
-            ("Consensus Log Po/w", format!("{:.2}", l.consensus_log_p)),
+            ("WLOGP (Crippen)", format!("{:.2}", l.wlogp)),
+            ("XLOGP3 (heur.)", format!("{:.2}", l.xlogp3)),
+            ("MLOGP (Moriguchi)", format!("{:.2}", l.mlogp)),
+            (
+                "Solvation est. (exp.)",
+                format!("{:.2}", l.solvation_logp_est),
+            ),
+            ("Topo est. (exp.)", format!("{:.2}", l.topological_logp_est)),
+            ("Consensus (3-model)", format!("{:.2}", l.consensus_log_p)),
         ],
     );
     y_left -= 12.0;
@@ -240,9 +548,22 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
         250.0,
         "Water Solubility",
         &[
-            ("Log S (ESOL)", format!("{:.2} ({})", w.esol.log_s, w.esol.class.as_str())),
-            ("Log S (Ali)", format!("{:.2} ({})", w.ali.log_s, w.ali.class.as_str())),
-            ("Log S (Silicos-IT)", format!("{:.2} ({})", w.silicos_it.log_s, w.silicos_it.class.as_str())),
+            (
+                "Log S (ESOL)",
+                format!("{:.2} ({})", w.esol.log_s, w.esol.class.as_str()),
+            ),
+            (
+                "Log S (Ali)",
+                format!("{:.2} ({})", w.ali.log_s, w.ali.class.as_str()),
+            ),
+            (
+                "Log S (Topo exp.)",
+                format!(
+                    "{:.2} ({})",
+                    w.topological_est.log_s,
+                    w.topological_est.class.as_str()
+                ),
+            ),
         ],
     );
 
@@ -256,12 +577,27 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
         &[
             ("GI absorption", pk.gi_absorption.as_str().to_string()),
             ("BBB permeant", yes_no(pk.bbb_permeant).to_string()),
-            ("P-gp substrate", yes_no(pk.pgp_substrate).to_string()),
-            ("CYP1A2 inhibitor", yes_no(pk.cyp1a2_inhibitor).to_string()),
-            ("CYP2C19 inhibitor", yes_no(pk.cyp2c19_inhibitor).to_string()),
-            ("CYP2C9 inhibitor", yes_no(pk.cyp2c9_inhibitor).to_string()),
-            ("CYP2D6 inhibitor", yes_no(pk.cyp2d6_inhibitor).to_string()),
-            ("CYP3A4 inhibitor", yes_no(pk.cyp3a4_inhibitor).to_string()),
+            ("P-gp (exp. heur.)", yes_no(pk.pgp_substrate).to_string()),
+            (
+                "CYP1A2 (exp. heur.)",
+                yes_no(pk.cyp1a2_inhibitor).to_string(),
+            ),
+            (
+                "CYP2C19 (exp. heur.)",
+                yes_no(pk.cyp2c19_inhibitor).to_string(),
+            ),
+            (
+                "CYP2C9 (exp. heur.)",
+                yes_no(pk.cyp2c9_inhibitor).to_string(),
+            ),
+            (
+                "CYP2D6 (exp. heur.)",
+                yes_no(pk.cyp2d6_inhibitor).to_string(),
+            ),
+            (
+                "CYP3A4 (exp. heur.)",
+                yes_no(pk.cyp3a4_inhibitor).to_string(),
+            ),
             ("Log Kp (skin perm.)", format!("{:.2} cm/s", pk.log_kp_cm_s)),
         ],
     );
@@ -273,24 +609,54 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
         250.0,
         "Druglikeness",
         &[
-            ("Lipinski", format!("{} ({} viol.)", yes_no(d.lipinski.pass), d.lipinski.violations)),
-            ("Ghose", format!("{} ({} viol.)", yes_no(d.ghose.pass), d.ghose.violations)),
-            ("Veber", format!("{} ({} viol.)", yes_no(d.veber.pass), d.veber.violations)),
-            ("Egan", format!("{} ({} viol.)", yes_no(d.egan.pass), d.egan.violations)),
-            ("Muegge", format!("{} ({} viol.)", yes_no(d.muegge.pass), d.muegge.violations)),
-            ("Bioavailability Score", format!("{:.2}", d.bioavailability_score)),
+            (
+                "Lipinski",
+                format!(
+                    "{} ({} viol.)",
+                    yes_no(d.lipinski.pass),
+                    d.lipinski.violations
+                ),
+            ),
+            (
+                "Ghose",
+                format!("{} ({} viol.)", yes_no(d.ghose.pass), d.ghose.violations),
+            ),
+            (
+                "Veber",
+                format!("{} ({} viol.)", yes_no(d.veber.pass), d.veber.violations),
+            ),
+            (
+                "Egan",
+                format!("{} ({} viol.)", yes_no(d.egan.pass), d.egan.violations),
+            ),
+            (
+                "Muegge",
+                format!("{} ({} viol.)", yes_no(d.muegge.pass), d.muegge.violations),
+            ),
+            (
+                "Bioavailability Score",
+                format!("{:.2}", d.bioavailability_score),
+            ),
         ],
     );
     y_right -= 12.0;
     let pains_desc = if mc.pains_alerts.is_empty() {
-        "0 alerts".to_string()
+        format!("0/{} checked", mc.pains_catalog_size)
     } else {
-        format!("{} ({})", mc.pains_alerts.len(), truncate(&mc.pains_alerts.join(", "), 24))
+        format!(
+            "{} ({})",
+            mc.pains_alerts.len(),
+            truncate(&mc.pains_alerts.join(", "), 20)
+        )
     };
     let brenk_desc = if mc.brenk_alerts.is_empty() {
-        "0 alerts".to_string()
+        format!("0/{} checked", mc.brenk_catalog_size)
     } else {
-        format!("{} ({})", mc.brenk_alerts.len(), truncate(&mc.brenk_alerts.join(", "), 24))
+        format!(
+            "{} ({})",
+            mc.brenk_alerts.len(),
+            truncate(&mc.brenk_alerts.join(", "), 20)
+        )
     };
     let _ = draw_kv_section(
         &mut s,
@@ -301,10 +667,32 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
         &[
             ("PAINS", pains_desc),
             ("Brenk", brenk_desc),
-            ("Leadlikeness", format!("{} ({} viol.)", yes_no(mc.leadlikeness.pass), mc.leadlikeness.violations)),
-            ("Synthetic accessibility", format!("{:.2}", mc.synthetic_accessibility)),
+            (
+                "Leadlikeness",
+                format!(
+                    "{} ({} viol.)",
+                    yes_no(mc.leadlikeness.pass),
+                    mc.leadlikeness.violations
+                ),
+            ),
+            (
+                "SA score (proxy)",
+                format!("{:.2}", mc.synthetic_accessibility),
+            ),
         ],
     );
+
+    if !eval.warnings.is_empty() {
+        draw_text(
+            &mut s,
+            "F1",
+            7.5,
+            40.0,
+            46.0,
+            (0.65, 0.25, 0.05),
+            &format!("Notes: {}", truncate(&eval.warnings.join(" | "), 110)),
+        );
+    }
 
     s
 }
@@ -325,7 +713,15 @@ fn draw_kv_section(
             draw_rect_fill(s, x, y - 3.0, w, 12.5, (0.96, 0.96, 0.97));
         }
         draw_text(s, "F1", 8.0, x + 6.0, y, (0.2, 0.2, 0.2), k);
-        draw_text(s, "F2", 8.0, x + w * 0.54, y, (0.08, 0.08, 0.08), &truncate(v, 24));
+        draw_text(
+            s,
+            "F2",
+            8.0,
+            x + w * 0.54,
+            y,
+            (0.08, 0.08, 0.08),
+            &truncate(v, 24),
+        );
         y -= 12.5;
     }
     y
@@ -336,18 +732,20 @@ fn draw_2d_mol_pdf(s: &mut String, smiles: &str, x: f64, y: f64, w: f64, h: f64)
         return;
     };
     ensure_2d_coords(&mut mol);
-    let coords: Vec<[f64; 2]> = mol
-        .atoms
-        .iter()
-        .filter_map(|a| a.coords_2d)
-        .collect();
+    let coords: Vec<[f64; 2]> = mol.atoms.iter().filter_map(|a| a.coords_2d).collect();
     if coords.len() != mol.atoms.len() || coords.is_empty() {
         return;
     }
     let min_x = coords.iter().map(|c| c[0]).fold(f64::INFINITY, f64::min);
-    let max_x = coords.iter().map(|c| c[0]).fold(f64::NEG_INFINITY, f64::max);
+    let max_x = coords
+        .iter()
+        .map(|c| c[0])
+        .fold(f64::NEG_INFINITY, f64::max);
     let min_y = coords.iter().map(|c| c[1]).fold(f64::INFINITY, f64::min);
-    let max_y = coords.iter().map(|c| c[1]).fold(f64::NEG_INFINITY, f64::max);
+    let max_y = coords
+        .iter()
+        .map(|c| c[1])
+        .fold(f64::NEG_INFINITY, f64::max);
     let span_x = (max_x - min_x).max(1.0);
     let span_y = (max_y - min_y).max(1.0);
     let scale = (w * 0.78 / span_x).min(h * 0.78 / span_y).min(24.0);
@@ -372,16 +770,72 @@ fn draw_2d_mol_pdf(s: &mut String, smiles: &str, x: f64, y: f64, w: f64, h: f64)
         let nx = -dy / len * 1.8;
         let ny = dx / len * 1.8;
         match b.order {
-            BondOrder::Single => draw_line(s, x1, y1, x2, y2, (0.15, 0.15, 0.15), 1.0),
-            BondOrder::Double | BondOrder::Aromatic => {
-                draw_line(s, x1 + nx, y1 + ny, x2 + nx, y2 + ny, (0.15, 0.15, 0.15), 0.9);
-                draw_line(s, x1 - nx, y1 - ny, x2 - nx, y2 - ny, (0.15, 0.15, 0.15), 0.9);
+            // Aromatic rings render cleanly as single polygon edges + inscribed aromatic circle
+            BondOrder::Single | BondOrder::Aromatic => {
+                draw_line(s, x1, y1, x2, y2, (0.15, 0.15, 0.15), 1.0);
+            }
+            BondOrder::Double => {
+                draw_line(
+                    s,
+                    x1 + nx,
+                    y1 + ny,
+                    x2 + nx,
+                    y2 + ny,
+                    (0.15, 0.15, 0.15),
+                    0.9,
+                );
+                draw_line(
+                    s,
+                    x1 - nx,
+                    y1 - ny,
+                    x2 - nx,
+                    y2 - ny,
+                    (0.15, 0.15, 0.15),
+                    0.9,
+                );
             }
             BondOrder::Triple => {
                 draw_line(s, x1, y1, x2, y2, (0.15, 0.15, 0.15), 0.9);
-                draw_line(s, x1 + nx * 1.4, y1 + ny * 1.4, x2 + nx * 1.4, y2 + ny * 1.4, (0.15, 0.15, 0.15), 0.8);
-                draw_line(s, x1 - nx * 1.4, y1 - ny * 1.4, x2 - nx * 1.4, y2 - ny * 1.4, (0.15, 0.15, 0.15), 0.8);
+                draw_line(
+                    s,
+                    x1 + nx * 1.4,
+                    y1 + ny * 1.4,
+                    x2 + nx * 1.4,
+                    y2 + ny * 1.4,
+                    (0.15, 0.15, 0.15),
+                    0.8,
+                );
+                draw_line(
+                    s,
+                    x1 - nx * 1.4,
+                    y1 - ny * 1.4,
+                    x2 - nx * 1.4,
+                    y2 - ny * 1.4,
+                    (0.15, 0.15, 0.15),
+                    0.8,
+                );
             }
+        }
+    }
+
+    // Draw inscribed circle for each fully aromatic ring
+    for ring in &mol.rings {
+        if ring.len() >= 5 && ring.iter().all(|&aid| mol.atoms[aid].aromatic) {
+            let r_pts: Vec<(f64, f64)> = ring.iter().map(|&aid| pt(aid)).collect();
+            let rcx = r_pts.iter().map(|p| p.0).sum::<f64>() / r_pts.len() as f64;
+            let rcy = r_pts.iter().map(|p| p.1).sum::<f64>() / r_pts.len() as f64;
+            let avg_r = r_pts
+                .iter()
+                .map(|p| ((p.0 - rcx).powi(2) + (p.1 - rcy).powi(2)).sqrt())
+                .sum::<f64>()
+                / r_pts.len() as f64;
+            let ring_pts: Vec<(f64, f64)> = (0..24)
+                .map(|i| {
+                    let a = 2.0 * PI * (i as f64) / 24.0;
+                    (rcx + avg_r * 0.58 * a.cos(), rcy + avg_r * 0.58 * a.sin())
+                })
+                .collect();
+            draw_polygon(s, &ring_pts, None, Some((0.25, 0.25, 0.28)), 0.75);
         }
     }
 
@@ -404,39 +858,43 @@ fn draw_2d_mol_pdf(s: &mut String, smiles: &str, x: f64, y: f64, w: f64, h: f64)
 }
 
 fn draw_radar_pdf(s: &mut String, eval: &MoleculeEvaluation, cx: f64, cy: f64, max_r: f64) {
+    let to_pdf = |(ux, uy): (f64, f64)| (cx + ux * max_r, cy + uy * max_r);
     let hex = |r: f64| -> Vec<(f64, f64)> {
-        (0..6)
-            .map(|i| {
-                let ang = PI / 2.0 - (i as f64) * PI / 3.0;
-                (cx + r * ang.cos(), cy + r * ang.sin())
-            })
+        BioavailabilityRadar::unit_hexagon(r)
+            .into_iter()
+            .map(to_pdf)
             .collect()
     };
-    draw_polygon(s, &hex(max_r * 0.85), Some((0.99, 0.89, 0.90)), Some((0.95, 0.65, 0.70)), 0.7);
-    draw_polygon(s, &hex(max_r * 0.25), Some((0.99, 0.99, 0.99)), Some((0.95, 0.65, 0.70)), 0.7);
+    draw_polygon(
+        s,
+        &hex(0.85),
+        Some((0.99, 0.89, 0.90)),
+        Some((0.95, 0.65, 0.70)),
+        0.7,
+    );
+    draw_polygon(
+        s,
+        &hex(0.25),
+        Some((0.99, 0.99, 0.99)),
+        Some((0.95, 0.65, 0.70)),
+        0.7,
+    );
     for frac in [0.5, 1.0] {
-        draw_polygon(s, &hex(max_r * frac), None, Some((0.80, 0.80, 0.80)), 0.5);
+        draw_polygon(s, &hex(frac), None, Some((0.80, 0.80, 0.80)), 0.5);
     }
-    let labels = ["LIPO", "SIZE", "POLAR", "INSOLU", "INSATU", "FLEX"];
-    for (i, label) in labels.iter().enumerate() {
-        let ang = PI / 2.0 - (i as f64) * PI / 3.0;
-        let x2 = cx + max_r * ang.cos();
-        let y2 = cy + max_r * ang.sin();
+    let full_hex = BioavailabilityRadar::unit_hexagon(1.0);
+    let label_hex = BioavailabilityRadar::unit_hexagon((max_r + 12.0) / max_r);
+    for (i, label) in BioavailabilityRadar::AXIS_LABELS.iter().enumerate() {
+        let (x2, y2) = to_pdf(full_hex[i]);
+        let (lx, ly) = to_pdf(label_hex[i]);
         draw_line(s, cx, cy, x2, y2, (0.80, 0.80, 0.80), 0.5);
-        let lx = cx + (max_r + 12.0) * ang.cos() - 10.0;
-        let ly = cy + (max_r + 12.0) * ang.sin() - 2.5;
-        draw_text(s, "F2", 6.5, lx, ly, (0.25, 0.25, 0.25), label);
+        draw_text(s, "F2", 6.5, lx - 10.0, ly - 2.5, (0.25, 0.25, 0.25), label);
     }
     let pts: Vec<(f64, f64)> = eval
         .bioavailability_radar
-        .normalized_axes
-        .iter()
-        .enumerate()
-        .map(|(i, &val)| {
-            let ang = PI / 2.0 - (i as f64) * PI / 3.0;
-            let r = max_r * val.clamp(0.05, 1.0);
-            (cx + r * ang.cos(), cy + r * ang.sin())
-        })
+        .unit_polygon()
+        .into_iter()
+        .map(to_pdf)
         .collect();
     draw_polygon(s, &pts, None, Some((0.79, 0.16, 0.16)), 1.5);
     for (px, py) in pts {
@@ -444,35 +902,12 @@ fn draw_radar_pdf(s: &mut String, eval: &MoleculeEvaluation, cx: f64, cy: f64, m
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn sample_ellipse_pdf(
-    center: (f64, f64),
-    axes: (f64, f64),
-    angle: f64,
-    min_x: f64,
-    max_x: f64,
-    min_y: f64,
-    max_y: f64,
-    map_x: &dyn Fn(f64) -> f64,
-    map_y: &dyn Fn(f64) -> f64,
-) -> Vec<(f64, f64)> {
-    let steps = 64;
-    let cos_a = angle.cos();
-    let sin_a = angle.sin();
-    (0..steps)
-        .map(|i| {
-            let t = 2.0 * PI * (i as f64) / (steps as f64);
-            let lx = axes.0 * t.cos();
-            let ly = axes.1 * t.sin();
-            let gx = center.0 + lx * cos_a - ly * sin_a;
-            let gy = center.1 + lx * sin_a + ly * cos_a;
-            (map_x(gx).clamp(min_x, max_x), map_y(gy).clamp(min_y, max_y))
-        })
-        .collect()
-}
-
 fn draw_rect_fill(s: &mut String, x: f64, y: f64, w: f64, h: f64, rgb: (f64, f64, f64)) {
-    let _ = writeln!(s, "{:.3} {:.3} {:.3} rg {:.2} {:.2} {:.2} {:.2} re f", rgb.0, rgb.1, rgb.2, x, y, w, h);
+    let _ = writeln!(
+        s,
+        "{:.3} {:.3} {:.3} rg {:.2} {:.2} {:.2} {:.2} re f",
+        rgb.0, rgb.1, rgb.2, x, y, w, h
+    );
 }
 
 fn draw_rect_fill_stroke(
@@ -546,7 +981,7 @@ fn draw_text(
     rgb: (f64, f64, f64),
     text: &str,
 ) {
-    let escaped = escape_pdf_str(text);
+    let escaped = escape_pdf_winansi(text);
     let _ = writeln!(
         s,
         "BT /{font} {size:.1} Tf {:.3} {:.3} {:.3} rg {x:.2} {y:.2} Td ({escaped}) Tj ET",
@@ -554,7 +989,9 @@ fn draw_text(
     );
 }
 
-fn escape_pdf_str(text: &str) -> String {
+/// Encode UTF-8 string into PDF WinAnsi (CP1252 / Latin-1) octal escapes so Spanish/European
+/// accents (`á, é, í, ó, ú, ñ, ü, ¿, ¡`, etc.) render properly instead of `?`.
+fn escape_pdf_winansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -562,10 +999,48 @@ fn escape_pdf_str(text: &str) -> String {
             '(' => out.push_str("\\("),
             ')' => out.push_str("\\)"),
             c if c.is_ascii() && !c.is_ascii_control() => out.push(c),
-            _ => out.push('?'),
+            c => {
+                let code = unicode_to_winansi(c);
+                let _ = write!(out, "\\{code:03o}");
+            }
         }
     }
     out
+}
+
+fn unicode_to_winansi(c: char) -> u8 {
+    let cp = c as u32;
+    if (0xA0..=0xFF).contains(&cp) {
+        return cp as u8;
+    }
+    match c {
+        '€' => 0x80,
+        '‚' => 0x82,
+        'ƒ' => 0x83,
+        '„' => 0x84,
+        '…' => 0x85,
+        '†' => 0x86,
+        '‡' => 0x87,
+        '‰' => 0x89,
+        'Š' => 0x8A,
+        '‹' => 0x8B,
+        'Œ' => 0x8C,
+        'Ž' => 0x8E,
+        '‘' => 0x91,
+        '’' => 0x92,
+        '“' => 0x93,
+        '”' => 0x94,
+        '•' => 0x95,
+        '–' => 0x96,
+        '—' => 0x97,
+        '™' => 0x99,
+        'š' => 0x9A,
+        '›' => 0x9B,
+        'œ' => 0x9C,
+        'ž' => 0x9E,
+        'Ÿ' => 0x9F,
+        _ => b'?',
+    }
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -583,14 +1058,6 @@ fn yes_no(b: bool) -> &'static str {
 }
 
 fn assemble_pdf(page_streams: &[String]) -> Vec<u8> {
-    // Object numbering:
-    // 1: Catalog
-    // 2: Pages
-    // 3: Font F1 (Helvetica)
-    // 4: Font F2 (Helvetica-Bold)
-    // For each page i (0..n):
-    //   page_obj = 5 + 2*i
-    //   content_obj = 6 + 2*i
     let mut out = Vec::<u8>::new();
     out.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -603,7 +1070,12 @@ fn assemble_pdf(page_streams: &[String]) -> Vec<u8> {
         buf.extend_from_slice(b"\nendobj\n");
     };
 
-    push_obj(&mut out, &mut offsets, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        1,
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+    );
 
     let kids: Vec<String> = (0..page_streams.len())
         .map(|i| format!("{} 0 R", 5 + 2 * i))
@@ -619,13 +1091,13 @@ fn assemble_pdf(page_streams: &[String]) -> Vec<u8> {
         &mut out,
         &mut offsets,
         3,
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
     );
     push_obj(
         &mut out,
         &mut offsets,
         4,
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
     );
 
     for (i, stream) in page_streams.iter().enumerate() {
@@ -638,7 +1110,8 @@ fn assemble_pdf(page_streams: &[String]) -> Vec<u8> {
         push_obj(&mut out, &mut offsets, page_id, page_body.as_bytes());
 
         let content_bytes = stream.as_bytes();
-        let mut stream_body = format!("<< /Length {} >>\nstream\n", content_bytes.len()).into_bytes();
+        let mut stream_body =
+            format!("<< /Length {} >>\nstream\n", content_bytes.len()).into_bytes();
         stream_body.extend_from_slice(content_bytes);
         stream_body.extend_from_slice(b"\nendstream");
         push_obj(&mut out, &mut offsets, content_id, &stream_body);
@@ -660,7 +1133,10 @@ fn write_xref(
     for &off in offsets {
         writeln!(s, "{off:010} 00000 n ")?;
     }
-    writeln!(s, "trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF")?;
+    writeln!(
+        s,
+        "trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF"
+    )?;
     out.extend_from_slice(s.as_bytes());
     Ok(())
 }

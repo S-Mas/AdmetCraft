@@ -175,6 +175,9 @@ pub struct Molecule {
     pub adj: Vec<Vec<(usize, usize)>>,
     /// Minimal rings (each ring is an ordered list of atom indices).
     pub rings: Vec<Vec<usize>>,
+    /// Non-fatal warnings emitted during parsing, desalting, or standardization.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl Default for Molecule {
@@ -193,6 +196,7 @@ impl Molecule {
             bonds: Vec::new(),
             adj: Vec::new(),
             rings: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -219,7 +223,9 @@ impl Molecule {
             )));
         }
         if u == v {
-            return Err(ChemError::Graph("self-loop bond is not allowed".to_string()));
+            return Err(ChemError::Graph(
+                "self-loop bond is not allowed".to_string(),
+            ));
         }
         if let Some((_, existing_id)) = self.adj[u].iter().find(|&&(nbr, _)| nbr == v) {
             return Ok(*existing_id);
@@ -269,11 +275,7 @@ impl Molecule {
     /// Heavy-atom degree (number of bonded heavy atoms).
     pub fn heavy_degree(&self, u: usize) -> usize {
         self.neighbors(u)
-            .filter(|&nbr| {
-                self.atoms
-                    .get(nbr)
-                    .is_some_and(|a| a.atomic_number != 1)
-            })
+            .filter(|&nbr| self.atoms.get(nbr).is_some_and(|a| a.atomic_number != 1))
             .count()
     }
 
@@ -308,6 +310,109 @@ impl Molecule {
         self.recompute_implicit_h();
         self.perceive_hybridization();
         Ok(())
+    }
+
+    /// Strip counterions / smaller disconnected fragments (desalting), keeping the largest
+    /// fragment by heavy-atom count (breaking ties by mass) and recording a warning.
+    pub fn desalt(&mut self) {
+        let n = self.atoms.len();
+        if n <= 1 {
+            return;
+        }
+        let mut seen = vec![false; n];
+        let mut comps: Vec<Vec<usize>> = Vec::new();
+        for start in 0..n {
+            if seen[start] {
+                continue;
+            }
+            let mut comp = Vec::new();
+            let mut q = VecDeque::new();
+            seen[start] = true;
+            q.push_back(start);
+            while let Some(u) = q.pop_front() {
+                comp.push(u);
+                for &(v, _) in &self.adj[u] {
+                    if !seen[v] {
+                        seen[v] = true;
+                        q.push_back(v);
+                    }
+                }
+            }
+            comps.push(comp);
+        }
+        if comps.len() <= 1 {
+            return;
+        }
+
+        // Select component with max (heavy_atoms, total_weight)
+        let mut best_idx = 0usize;
+        let mut best_score = (0usize, 0i64);
+        for (idx, comp) in comps.iter().enumerate() {
+            let heavy = comp
+                .iter()
+                .filter(|&&a| self.atoms[a].atomic_number != 1)
+                .count();
+            let mass_milli = (comp
+                .iter()
+                .map(|&a| self.atoms[a].atomic_weight())
+                .sum::<f64>()
+                * 1000.0) as i64;
+            if (heavy, mass_milli) > best_score {
+                best_score = (heavy, mass_milli);
+                best_idx = idx;
+            }
+        }
+
+        let mut stripped_labels = Vec::new();
+        for (idx, comp) in comps.iter().enumerate() {
+            if idx != best_idx {
+                let syms: Vec<String> = comp
+                    .iter()
+                    .take(4)
+                    .map(|&a| self.atoms[a].symbol.clone())
+                    .collect();
+                let label = if comp.len() > 4 {
+                    format!("{}...", syms.join(""))
+                } else {
+                    syms.join("")
+                };
+                stripped_labels.push(label);
+            }
+        }
+
+        let keep_set: BTreeSet<usize> = comps[best_idx].iter().copied().collect();
+        let mut new_idx_map: Vec<Option<usize>> = vec![None; n];
+        let mut new_atoms = Vec::new();
+        for (old_idx, mut atom) in self.atoms.drain(..).enumerate() {
+            if !keep_set.contains(&old_idx) {
+                continue;
+            }
+            let nid = new_atoms.len();
+            atom.id = nid;
+            new_idx_map[old_idx] = Some(nid);
+            new_atoms.push(atom);
+        }
+        let mut new_bonds = Vec::new();
+        let mut new_adj = vec![Vec::new(); new_atoms.len()];
+        for mut b in self.bonds.drain(..) {
+            if let (Some(nu), Some(nv)) = (new_idx_map[b.u], new_idx_map[b.v]) {
+                let id = new_bonds.len();
+                b.id = id;
+                b.u = nu;
+                b.v = nv;
+                new_bonds.push(b);
+                new_adj[nu].push((nv, id));
+                new_adj[nv].push((nu, id));
+            }
+        }
+        self.atoms = new_atoms;
+        self.bonds = new_bonds;
+        self.adj = new_adj;
+        self.warnings.push(format!(
+            "Desalted: stripped {} counterion/fragment(s) ({}); kept largest fragment.",
+            stripped_labels.len(),
+            stripped_labels.join(", ")
+        ));
     }
 
     /// Strip explicit hydrogen nodes (merging their count onto heavy parent `explicit_h`)
@@ -414,7 +519,11 @@ impl Molecule {
                     .chain(
                         cycle
                             .last()
-                            .and_then(|&last| cycle.first().and_then(|&first| self.bond_between(last, first)))
+                            .and_then(|&last| {
+                                cycle
+                                    .first()
+                                    .and_then(|&first| self.bond_between(last, first))
+                            })
                             .map(|bd| bd.id),
                     )
                     .collect();
@@ -441,7 +550,11 @@ impl Molecule {
                             .chain(
                                 cycle
                                     .last()
-                                    .and_then(|&last| cycle.first().and_then(|&first| self.bond_between(last, first)))
+                                    .and_then(|&last| {
+                                        cycle
+                                            .first()
+                                            .and_then(|&first| self.bond_between(last, first))
+                                    })
                                     .map(|bd| bd.id),
                             )
                             .collect();
@@ -498,7 +611,12 @@ impl Molecule {
         }
     }
 
-    fn shortest_cycle_through_edge(&self, u: usize, v: usize, skip_bond: usize) -> Option<Vec<usize>> {
+    fn shortest_cycle_through_edge(
+        &self,
+        u: usize,
+        v: usize,
+        skip_bond: usize,
+    ) -> Option<Vec<usize>> {
         let n = self.atoms.len();
         let mut parent = vec![usize::MAX; n];
         let mut dist = vec![usize::MAX; n];
@@ -695,7 +813,10 @@ impl Molecule {
                         has_endo_aromatic = true;
                     }
                 } else if bond.order == BondOrder::Double
-                    && self.atoms.get(nbr).is_some_and(|n| matches!(n.atomic_number, 7 | 8 | 16))
+                    && self
+                        .atoms
+                        .get(nbr)
+                        .is_some_and(|n| matches!(n.atomic_number, 7 | 8 | 16))
                 {
                     has_exo_double_hetero = true;
                 }
@@ -722,10 +843,18 @@ impl Molecule {
                     } else if has_endo_double {
                         // Pyridine-like N
                         1
-                    } else if atom.aromatic && !has_endo_double && atom.explicit_h == 0 && total_bonds == 2 && !atom.from_bracket {
+                    } else if atom.aromatic
+                        && !has_endo_double
+                        && atom.explicit_h == 0
+                        && total_bonds == 2
+                        && !atom.from_bracket
+                    {
                         // Aromatic pyridine-like `n` in SMILES
                         1
-                    } else if atom.explicit_h > 0 || total_bonds == 3 || (atom.from_bracket && atom.explicit_h > 0) {
+                    } else if atom.explicit_h > 0
+                        || total_bonds == 3
+                        || (atom.from_bracket && atom.explicit_h > 0)
+                    {
                         // Pyrrole-like [nH] or N-R
                         2
                     } else if has_endo_aromatic {
@@ -844,7 +973,8 @@ impl Molecule {
                     }
                 }
             }
-            hybs[idx] = if has_triple || (double_count >= 2 && matches!(atom.atomic_number, 6 | 7)) {
+            hybs[idx] = if has_triple || (double_count >= 2 && matches!(atom.atomic_number, 6 | 7))
+            {
                 Hybridization::Sp
             } else if double_count == 1 && matches!(atom.atomic_number, 6..=8) {
                 Hybridization::Sp2
@@ -979,135 +1109,181 @@ impl Molecule {
         ranks: &[u64],
         visited: &mut [bool],
     ) -> String {
-        // First build DFS spanning tree to identify ring-closure edges
+        // 1. Iterative DFS spanning tree to identify ring-closure edges (stack-safe for 28k+ atoms)
         let mut tree_visited = vec![false; self.atoms.len()];
-        let mut parent = vec![usize::MAX; self.atoms.len()];
         let mut closure_bonds: Vec<usize> = Vec::new();
-        self.find_closures_dfs(start, usize::MAX, ranks, &mut tree_visited, &mut parent, &mut closure_bonds);
+        let mut closure_set: BTreeSet<usize> = BTreeSet::new();
 
-        // Assign ring closure numbers to edges
-        let mut atom_closures: Vec<Vec<(usize, u16, BondOrder)>> = vec![Vec::new(); self.atoms.len()];
-        for (idx, &bid) in closure_bonds.iter().enumerate() {
-            let b = &self.bonds[bid];
-            let num = (idx + 1) as u16;
-            atom_closures[b.u].push((b.v, num, b.order));
-            atom_closures[b.v].push((b.u, num, b.order));
+        struct TreeFrame {
+            u: usize,
+            parent: usize,
+            nbrs: Vec<(usize, usize)>,
+            next: usize,
         }
 
-        let mut out = String::new();
-        let mut closed_started: BTreeSet<u16> = BTreeSet::new();
-        self.write_smiles_dfs(
-            start,
-            usize::MAX,
-            ranks,
-            visited,
-            &closure_bonds,
-            &atom_closures,
-            &mut closed_started,
-            &mut out,
-        );
-        out
-    }
+        let mut tree_stack: Vec<TreeFrame> = Vec::new();
+        let mut init_nbrs = self.adj[start].clone();
+        init_nbrs.sort_by_key(|&(v, _)| (ranks[v], v));
+        tree_visited[start] = true;
+        tree_stack.push(TreeFrame {
+            u: start,
+            parent: usize::MAX,
+            nbrs: init_nbrs,
+            next: 0,
+        });
 
-    fn find_closures_dfs(
-        &self,
-        u: usize,
-        p: usize,
-        ranks: &[u64],
-        tree_visited: &mut [bool],
-        parent: &mut [usize],
-        closure_bonds: &mut Vec<usize>,
-    ) {
-        tree_visited[u] = true;
-        parent[u] = p;
-        let mut nbrs: Vec<(usize, usize)> = self.adj[u].clone();
-        nbrs.sort_by_key(|&(v, _)| (ranks[v], v));
-        for (v, bid) in nbrs {
-            if v == p {
+        while let Some(frame) = tree_stack.last_mut() {
+            if frame.next >= frame.nbrs.len() {
+                tree_stack.pop();
+                continue;
+            }
+            let parent_u = frame.u;
+            let (v, bid) = frame.nbrs[frame.next];
+            frame.next += 1;
+            if v == frame.parent {
                 continue;
             }
             if !tree_visited[v] {
-                self.find_closures_dfs(v, u, ranks, tree_visited, parent, closure_bonds);
-            } else if !closure_bonds.contains(&bid) {
+                tree_visited[v] = true;
+                let mut nbrs = self.adj[v].clone();
+                nbrs.sort_by_key(|&(nv, _)| (ranks[nv], nv));
+                tree_stack.push(TreeFrame {
+                    u: v,
+                    parent: parent_u,
+                    nbrs,
+                    next: 0,
+                });
+            } else if closure_set.insert(bid) {
                 closure_bonds.push(bid);
             }
         }
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    fn write_smiles_dfs(
-        &self,
-        u: usize,
-        p: usize,
-        ranks: &[u64],
-        visited: &mut [bool],
-        closure_bonds: &[usize],
-        atom_closures: &[Vec<(usize, u16, BondOrder)>],
-        closed_started: &mut BTreeSet<u16>,
-        out: &mut String,
-    ) {
-        visited[u] = true;
-        out.push_str(&self.format_smiles_atom(u));
-
-        for &(_, num, border) in &atom_closures[u] {
-            if !closed_started.contains(&num) {
-                closed_started.insert(num);
-                if border == BondOrder::Double {
-                    out.push('=');
-                } else if border == BondOrder::Triple {
-                    out.push('#');
-                }
-            }
-            if num < 10 {
-                out.push_str(&num.to_string());
-            } else {
-                out.push('%');
-                out.push_str(&format!("{num:02}"));
-            }
+        // Index closure bonds per endpoint atom
+        let mut atom_closure_bonds: Vec<Vec<(usize, usize, BondOrder)>> =
+            vec![Vec::new(); self.atoms.len()];
+        for &bid in &closure_bonds {
+            let b = &self.bonds[bid];
+            atom_closure_bonds[b.u].push((bid, b.v, b.order));
+            atom_closure_bonds[b.v].push((bid, b.u, b.order));
+        }
+        for list in &mut atom_closure_bonds {
+            list.sort_by_key(|&(_, other, _)| (ranks[other], other));
         }
 
-        let mut children: Vec<(usize, usize)> = self.adj[u]
-            .iter()
-            .copied()
-            .filter(|&(v, bid)| v != p && !closure_bonds.contains(&bid) && !visited[v])
-            .collect();
-        children.sort_by_key(|&(v, _)| (ranks[v], v));
+        // 2. Iterative SMILES emission with reusable ring-closure number pool (1..=99)
+        enum EmitOp {
+            Visit {
+                u: usize,
+                p: usize,
+                bond_from_parent: Option<BondOrder>,
+                parent_aromatic: bool,
+            },
+            Text(char),
+        }
 
-        for (idx, (v, bid)) in children.iter().enumerate() {
-            let is_last = idx + 1 == children.len();
-            if !is_last {
-                out.push('(');
-            }
-            let border = self.bonds[*bid].order;
-            match border {
-                BondOrder::Double => out.push('='),
-                BondOrder::Triple => out.push('#'),
-                BondOrder::Single => {
-                    if self.atoms[u].aromatic && self.atoms[*v].aromatic {
-                        out.push('-');
+        let mut out = String::new();
+        let mut used_nums = [false; 100]; // 1..=99
+        let mut active_bond_num: std::collections::HashMap<usize, u16> =
+            std::collections::HashMap::new();
+        let mut emit_stack = vec![EmitOp::Visit {
+            u: start,
+            p: usize::MAX,
+            bond_from_parent: None,
+            parent_aromatic: false,
+        }];
+
+        while let Some(op) = emit_stack.pop() {
+            match op {
+                EmitOp::Text(c) => out.push(c),
+                EmitOp::Visit {
+                    u,
+                    p,
+                    bond_from_parent,
+                    parent_aromatic,
+                } => {
+                    if visited[u] {
+                        continue;
+                    }
+                    visited[u] = true;
+
+                    if let Some(border) = bond_from_parent {
+                        match border {
+                            BondOrder::Double => out.push('='),
+                            BondOrder::Triple => out.push('#'),
+                            BondOrder::Single => {
+                                if parent_aromatic && self.atoms[u].aromatic {
+                                    out.push('-');
+                                }
+                            }
+                            BondOrder::Aromatic => {}
+                        }
+                    }
+
+                    out.push_str(&self.format_smiles_atom(u));
+
+                    // Close already-opened rings first so numbers return to pool immediately
+                    let mut to_open: Vec<(usize, BondOrder)> = Vec::new();
+                    for &(bid, _, border) in &atom_closure_bonds[u] {
+                        if let Some(num) = active_bond_num.remove(&bid) {
+                            push_ring_tag(&mut out, num);
+                            if usize::from(num) < used_nums.len() {
+                                used_nums[usize::from(num)] = false;
+                            }
+                        } else {
+                            to_open.push((bid, border));
+                        }
+                    }
+
+                    // Open new rings using lowest available ring number 1..=99
+                    for (bid, border) in to_open {
+                        let Some(num) = (1..=99u16).find(|&n| !used_nums[usize::from(n)]) else {
+                            continue;
+                        };
+                        used_nums[usize::from(num)] = true;
+                        active_bond_num.insert(bid, num);
+                        if border == BondOrder::Double {
+                            out.push('=');
+                        } else if border == BondOrder::Triple {
+                            out.push('#');
+                        }
+                        push_ring_tag(&mut out, num);
+                    }
+
+                    let mut children: Vec<(usize, usize)> = self.adj[u]
+                        .iter()
+                        .copied()
+                        .filter(|&(v, bid)| v != p && !closure_set.contains(&bid) && !visited[v])
+                        .collect();
+                    children.sort_by_key(|&(v, _)| (ranks[v], v));
+
+                    let n_children = children.len();
+                    for (idx, (v, bid)) in children.into_iter().enumerate().rev() {
+                        let is_last = idx + 1 == n_children;
+                        if !is_last {
+                            emit_stack.push(EmitOp::Text(')'));
+                        }
+                        emit_stack.push(EmitOp::Visit {
+                            u: v,
+                            p: u,
+                            bond_from_parent: Some(self.bonds[bid].order),
+                            parent_aromatic: self.atoms[u].aromatic,
+                        });
+                        if !is_last {
+                            emit_stack.push(EmitOp::Text('('));
+                        }
                     }
                 }
-                BondOrder::Aromatic => {}
-            }
-            self.write_smiles_dfs(
-                *v,
-                u,
-                ranks,
-                visited,
-                closure_bonds,
-                atom_closures,
-                closed_started,
-                out,
-            );
-            if !is_last {
-                out.push(')');
             }
         }
+        out
     }
 
     fn format_smiles_atom(&self, u: usize) -> String {
         let a = &self.atoms[u];
-        let organic = matches!(a.symbol.as_str(), "B" | "C" | "N" | "O" | "P" | "S" | "F" | "Cl" | "Br" | "I");
+        let organic = matches!(
+            a.symbol.as_str(),
+            "B" | "C" | "N" | "O" | "P" | "S" | "F" | "Cl" | "Br" | "I"
+        );
         let needs_brackets = !organic
             || a.formal_charge != 0
             || a.isotope.is_some()
@@ -1149,6 +1325,15 @@ impl Molecule {
         }
         s.push(']');
         s
+    }
+}
+
+fn push_ring_tag(out: &mut String, num: u16) {
+    if num < 10 {
+        out.push_str(&num.to_string());
+    } else {
+        out.push('%');
+        out.push_str(&format!("{num:02}"));
     }
 }
 

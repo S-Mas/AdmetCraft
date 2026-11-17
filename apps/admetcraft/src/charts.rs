@@ -1,16 +1,22 @@
-use std::f32::consts::PI;
+use std::collections::HashMap;
 
-use admet_calc::MoleculeEvaluation;
 use admet_calc::pharmacokinetics::{
     BOILED_EGG_WHITE_ANGLE_RAD, BOILED_EGG_WHITE_AXES, BOILED_EGG_WHITE_CENTER,
     BOILED_EGG_YOLK_ANGLE_RAD, BOILED_EGG_YOLK_AXES, BOILED_EGG_YOLK_CENTER,
 };
+use admet_calc::{BioavailabilityRadar, BoiledEggGeometry, MoleculeEvaluation};
+use chem_core::Molecule;
 use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
-use crate::sketcher::draw_molecule_2d;
+use crate::sketcher::draw_cached_molecule_2d;
 
-/// Render the 6-axis Bioavailability Radar with pink optimal zone (`LIPO, SIZE, POLAR, INSOLU, INSATU, FLEX`).
-pub fn draw_bioavailability_radar(ui: &mut Ui, eval: &MoleculeEvaluation, size: f32, dark_mode: bool) {
+/// Render the 6-axis Bioavailability Radar using shared `BioavailabilityRadar` geometry.
+pub fn draw_bioavailability_radar(
+    ui: &mut Ui,
+    eval: &MoleculeEvaluation,
+    size: f32,
+    dark_mode: bool,
+) {
     let (rect, _resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let painter = ui.painter_at(rect);
 
@@ -25,28 +31,28 @@ pub fn draw_bioavailability_radar(ui: &mut Ui, eval: &MoleculeEvaluation, size: 
     let cy = rect.center().y;
     let max_r = size * 0.35;
 
-    let hex = |r: f32| -> Vec<Pos2> {
-        (0..6)
-            .map(|i| {
-                let ang = -PI / 2.0 + (i as f32) * PI / 3.0;
-                Pos2::new(cx + r * ang.cos(), cy + r * ang.sin())
-            })
+    let to_screen = |(ux, uy): (f64, f64)| -> Pos2 {
+        Pos2::new(cx + (ux as f32) * max_r, cy - (uy as f32) * max_r)
+    };
+    let hex = |r: f64| -> Vec<Pos2> {
+        BioavailabilityRadar::unit_hexagon(r)
+            .into_iter()
+            .map(to_screen)
             .collect()
     };
 
-    // Pink optimal zone ring (0.25 .. 0.85)
     let pink_fill = if dark_mode {
         Color32::from_rgba_unmultiplied(210, 75, 95, 65)
     } else {
         Color32::from_rgb(253, 226, 228)
     };
     painter.add(Shape::convex_polygon(
-        hex(max_r * 0.85),
+        hex(0.85),
         pink_fill,
         Stroke::new(1.0_f32, Color32::from_rgb(240, 150, 165)),
     ));
     painter.add(Shape::convex_polygon(
-        hex(max_r * 0.25),
+        hex(0.25),
         bg,
         Stroke::new(1.0_f32, Color32::from_rgb(240, 150, 165)),
     ));
@@ -57,20 +63,23 @@ pub fn draw_bioavailability_radar(ui: &mut Ui, eval: &MoleculeEvaluation, size: 
         Color32::from_rgb(205, 205, 205)
     };
     for frac in [0.5, 1.0] {
-        painter.add(Shape::closed_line(hex(max_r * frac), Stroke::new(0.8_f32, grid_col)));
+        painter.add(Shape::closed_line(
+            hex(frac),
+            Stroke::new(0.8_f32, grid_col),
+        ));
     }
 
-    let labels = ["LIPO", "SIZE", "POLAR", "INSOLU", "INSATU", "FLEX"];
     let label_col = if dark_mode {
         Color32::from_rgb(210, 214, 220)
     } else {
         Color32::from_rgb(60, 60, 65)
     };
-    for (i, label) in labels.iter().enumerate() {
-        let ang = -PI / 2.0 + (i as f32) * PI / 3.0;
-        let end = Pos2::new(cx + max_r * ang.cos(), cy + max_r * ang.sin());
+    let full_hex = BioavailabilityRadar::unit_hexagon(1.0);
+    let label_hex = BioavailabilityRadar::unit_hexagon(f64::from(max_r + 16.0) / f64::from(max_r));
+    for (i, label) in BioavailabilityRadar::AXIS_LABELS.iter().enumerate() {
+        let end = to_screen(full_hex[i]);
+        let lpos = to_screen(label_hex[i]);
         painter.line_segment([Pos2::new(cx, cy), end], Stroke::new(0.8_f32, grid_col));
-        let lpos = Pos2::new(cx + (max_r + 18.0) * ang.cos(), cy + (max_r + 14.0) * ang.sin());
         painter.text(
             lpos,
             egui::Align2::CENTER_CENTER,
@@ -80,17 +89,11 @@ pub fn draw_bioavailability_radar(ui: &mut Ui, eval: &MoleculeEvaluation, size: 
         );
     }
 
-    // Molecule polygon
     let mol_pts: Vec<Pos2> = eval
         .bioavailability_radar
-        .normalized_axes
-        .iter()
-        .enumerate()
-        .map(|(i, &val)| {
-            let ang = -PI / 2.0 + (i as f32) * PI / 3.0;
-            let r = max_r * (val as f32).clamp(0.05, 1.0);
-            Pos2::new(cx + r * ang.cos(), cy + r * ang.sin())
-        })
+        .unit_polygon()
+        .into_iter()
+        .map(to_screen)
         .collect();
     painter.add(Shape::convex_polygon(
         mol_pts.clone(),
@@ -102,10 +105,11 @@ pub fn draw_bioavailability_radar(ui: &mut Ui, eval: &MoleculeEvaluation, size: 
     }
 }
 
-/// Interactive BOILED-Egg scatter plot. Returns `Some(index)` if the user clicks a molecule point.
+/// Interactive BOILED-Egg scatter plot using shared `BoiledEggGeometry` and cached 2D molecules.
 pub fn draw_boiled_egg_interactive(
     ui: &mut Ui,
     evals: &[MoleculeEvaluation],
+    mol_cache: &HashMap<String, Molecule>,
     show_names: bool,
     selected_idx: Option<usize>,
     dark_mode: bool,
@@ -132,42 +136,44 @@ pub fn draw_boiled_egg_interactive(
     );
 
     let map_x = |tpsa: f64| -> f32 {
-        plot_rect.min.x + ((tpsa / 200.0) as f32) * plot_rect.width()
+        (plot_rect.min.x + ((tpsa / 200.0) as f32) * plot_rect.width())
+            .clamp(plot_rect.min.x, plot_rect.max.x)
     };
     let map_y = |wlogp: f64| -> f32 {
-        plot_rect.max.y - (((wlogp + 4.0) / 12.0) as f32) * plot_rect.height()
+        (plot_rect.max.y - (((wlogp + 4.0) / 12.0) as f32) * plot_rect.height())
+            .clamp(plot_rect.min.y, plot_rect.max.y)
     };
 
-    // White (GI) & Yolk (BBB) ellipses
-    let white_poly = sample_ellipse_egui(
+    let white_poly: Vec<Pos2> = BoiledEggGeometry::sample_ellipse(
         BOILED_EGG_WHITE_CENTER,
         BOILED_EGG_WHITE_AXES,
         BOILED_EGG_WHITE_ANGLE_RAD,
-        plot_rect,
-        &map_x,
-        &map_y,
-    );
+        72,
+    )
+    .into_iter()
+    .map(|(x, y)| Pos2::new(map_x(x), map_y(y)))
+    .collect();
     painter.add(Shape::convex_polygon(
         white_poly,
         Color32::WHITE,
         Stroke::new(1.0_f32, Color32::from_rgb(140, 140, 145)),
     ));
 
-    let yolk_poly = sample_ellipse_egui(
+    let yolk_poly: Vec<Pos2> = BoiledEggGeometry::sample_ellipse(
         BOILED_EGG_YOLK_CENTER,
         BOILED_EGG_YOLK_AXES,
         BOILED_EGG_YOLK_ANGLE_RAD,
-        plot_rect,
-        &map_x,
-        &map_y,
-    );
+        72,
+    )
+    .into_iter()
+    .map(|(x, y)| Pos2::new(map_x(x), map_y(y)))
+    .collect();
     painter.add(Shape::convex_polygon(
         yolk_poly,
         Color32::from_rgb(245, 197, 24),
         Stroke::new(1.0_f32, Color32::from_rgb(195, 148, 0)),
     ));
 
-    // Axes ticks
     let tick_col = if dark_mode {
         Color32::from_rgb(200, 200, 205)
     } else {
@@ -176,7 +182,10 @@ pub fn draw_boiled_egg_interactive(
     for t in [0, 40, 80, 120, 160, 200] {
         let x = map_x(f64::from(t));
         painter.line_segment(
-            [Pos2::new(x, plot_rect.max.y), Pos2::new(x, plot_rect.max.y + 4.0)],
+            [
+                Pos2::new(x, plot_rect.max.y),
+                Pos2::new(x, plot_rect.max.y + 4.0),
+            ],
             Stroke::new(1.0_f32, tick_col),
         );
         painter.text(
@@ -190,7 +199,10 @@ pub fn draw_boiled_egg_interactive(
     for lp in [-4, -2, 0, 2, 4, 6, 8] {
         let y = map_y(f64::from(lp));
         painter.line_segment(
-            [Pos2::new(plot_rect.min.x - 4.0, y), Pos2::new(plot_rect.min.x, y)],
+            [
+                Pos2::new(plot_rect.min.x - 4.0, y),
+                Pos2::new(plot_rect.min.x, y),
+            ],
             Stroke::new(1.0_f32, tick_col),
         );
         painter.text(
@@ -216,7 +228,6 @@ pub fn draw_boiled_egg_interactive(
         tick_col,
     );
 
-    // Draw points & detect hover / click
     let pointer_pos = response.hover_pos();
     let mut hovered_idx: Option<usize> = None;
     let mut clicked_idx: Option<usize> = None;
@@ -263,7 +274,6 @@ pub fn draw_boiled_egg_interactive(
         }
     }
 
-    // Legend box
     let lx = plot_rect.max.x + 14.0;
     let ly = plot_rect.min.y + 6.0;
     let legend_rect = Rect::from_min_size(Pos2::new(lx, ly), Vec2::new(138.0, 155.0));
@@ -282,23 +292,59 @@ pub fn draw_boiled_egg_interactive(
         Stroke::new(1.0_f32, Color32::from_rgb(170, 170, 175)),
         egui::StrokeKind::Outside,
     );
-    let leg_txt = if dark_mode { Color32::WHITE } else { Color32::BLACK };
+    let leg_txt = if dark_mode {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
     painter.rect_filled(
         Rect::from_min_size(Pos2::new(lx + 10.0, ly + 14.0), Vec2::splat(12.0)),
         1.0,
         Color32::WHITE,
     );
-    painter.text(Pos2::new(lx + 28.0, ly + 20.0), egui::Align2::LEFT_CENTER, "HIA (White)", egui::FontId::proportional(11.0), leg_txt);
+    painter.text(
+        Pos2::new(lx + 28.0, ly + 20.0),
+        egui::Align2::LEFT_CENTER,
+        "HIA (White)",
+        egui::FontId::proportional(11.0),
+        leg_txt,
+    );
     painter.rect_filled(
         Rect::from_min_size(Pos2::new(lx + 10.0, ly + 36.0), Vec2::splat(12.0)),
         1.0,
         Color32::from_rgb(245, 197, 24),
     );
-    painter.text(Pos2::new(lx + 28.0, ly + 42.0), egui::Align2::LEFT_CENTER, "BBB (Yolk)", egui::FontId::proportional(11.0), leg_txt);
-    painter.circle_filled(Pos2::new(lx + 16.0, ly + 66.0), 5.0, Color32::from_rgb(28, 126, 214));
-    painter.text(Pos2::new(lx + 28.0, ly + 66.0), egui::Align2::LEFT_CENTER, "PGP+", egui::FontId::proportional(11.0), leg_txt);
-    painter.circle_filled(Pos2::new(lx + 16.0, ly + 88.0), 5.0, Color32::from_rgb(224, 49, 49));
-    painter.text(Pos2::new(lx + 28.0, ly + 88.0), egui::Align2::LEFT_CENTER, "PGP-", egui::FontId::proportional(11.0), leg_txt);
+    painter.text(
+        Pos2::new(lx + 28.0, ly + 42.0),
+        egui::Align2::LEFT_CENTER,
+        "BBB (Yolk)",
+        egui::FontId::proportional(11.0),
+        leg_txt,
+    );
+    painter.circle_filled(
+        Pos2::new(lx + 16.0, ly + 66.0),
+        5.0,
+        Color32::from_rgb(28, 126, 214),
+    );
+    painter.text(
+        Pos2::new(lx + 28.0, ly + 66.0),
+        egui::Align2::LEFT_CENTER,
+        "PGP+",
+        egui::FontId::proportional(11.0),
+        leg_txt,
+    );
+    painter.circle_filled(
+        Pos2::new(lx + 16.0, ly + 88.0),
+        5.0,
+        Color32::from_rgb(224, 49, 49),
+    );
+    painter.text(
+        Pos2::new(lx + 28.0, ly + 88.0),
+        egui::Align2::LEFT_CENTER,
+        "PGP-",
+        egui::FontId::proportional(11.0),
+        leg_txt,
+    );
     painter.text(
         Pos2::new(lx + 10.0, ly + 124.0),
         egui::Align2::LEFT_CENTER,
@@ -307,7 +353,6 @@ pub fn draw_boiled_egg_interactive(
         Color32::from_rgb(130, 130, 135),
     );
 
-    // Floating hover tooltip with 2D structure preview!
     if let Some(hi) = hovered_idx {
         let e = &evals[hi];
         egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new("egg_hover"), |ui| {
@@ -318,42 +363,26 @@ pub fn draw_boiled_egg_interactive(
                 e.boiled_egg.wlogp, e.boiled_egg.tpsa
             ));
             ui.label(format!(
-                "GI: {}  |  BBB: {}  |  PGP: {}",
+                "GI: {}  |  BBB: {}  |  PGP (exp.): {}",
                 e.pharmacokinetics.gi_absorption.as_str(),
-                if e.pharmacokinetics.bbb_permeant { "Yes" } else { "No" },
-                if e.boiled_egg.pgp_substrate { "PGP+" } else { "PGP-" }
+                if e.pharmacokinetics.bbb_permeant {
+                    "Yes"
+                } else {
+                    "No"
+                },
+                if e.boiled_egg.pgp_substrate {
+                    "PGP+"
+                } else {
+                    "PGP-"
+                }
             ));
-            let (srect, _) = ui.allocate_exact_size(Vec2::new(170.0, 110.0), Sense::hover());
-            let spainter = ui.painter_at(srect);
-            draw_molecule_2d(&spainter, &e.canonical_smiles, srect, dark_mode);
+            if let Some(mol) = mol_cache.get(&e.canonical_smiles) {
+                let (srect, _) = ui.allocate_exact_size(Vec2::new(170.0, 110.0), Sense::hover());
+                let spainter = ui.painter_at(srect);
+                draw_cached_molecule_2d(&spainter, mol, srect, dark_mode);
+            }
         });
     }
 
     clicked_idx
-}
-
-fn sample_ellipse_egui(
-    center: (f64, f64),
-    axes: (f64, f64),
-    angle: f64,
-    plot_rect: Rect,
-    map_x: &dyn Fn(f64) -> f32,
-    map_y: &dyn Fn(f64) -> f32,
-) -> Vec<Pos2> {
-    let steps = 72;
-    let cos_a = angle.cos();
-    let sin_a = angle.sin();
-    (0..steps)
-        .map(|i| {
-            let t = 2.0 * std::f64::consts::PI * (i as f64) / (steps as f64);
-            let lx = axes.0 * t.cos();
-            let ly = axes.1 * t.sin();
-            let gx = center.0 + lx * cos_a - ly * sin_a;
-            let gy = center.1 + lx * sin_a + ly * cos_a;
-            Pos2::new(
-                map_x(gx).clamp(plot_rect.min.x, plot_rect.max.x),
-                map_y(gy).clamp(plot_rect.min.y, plot_rect.max.y),
-            )
-        })
-        .collect()
 }

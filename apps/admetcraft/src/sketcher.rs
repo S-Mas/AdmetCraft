@@ -115,7 +115,12 @@ impl MoleculeSketcher {
         };
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, bg);
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, border), egui::StrokeKind::Outside);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0_f32, border),
+            egui::StrokeKind::Outside,
+        );
 
         let view = CanvasTransform::fit_molecule(&self.mol, rect);
 
@@ -139,11 +144,15 @@ impl MoleculeSketcher {
 
         // Drag preview line
         if response.dragged()
-            && let (Some(src), Some(cur_pos)) = (self.drag_from_atom, response.interact_pointer_pos())
+            && let (Some(src), Some(cur_pos)) =
+                (self.drag_from_atom, response.interact_pointer_pos())
             && let Some(c) = self.mol.atoms.get(src).and_then(|a| a.coords_2d)
         {
             let p0 = view.to_screen(c);
-            painter.line_segment([p0, cur_pos], Stroke::new(1.5_f32, Color32::from_rgb(220, 90, 90)));
+            painter.line_segment(
+                [p0, cur_pos],
+                Stroke::new(1.5_f32, Color32::from_rgb(220, 90, 90)),
+            );
         }
 
         if changed {
@@ -254,7 +263,9 @@ impl MoleculeSketcher {
                 self.selected_atom = Some(new_id);
                 true
             }
-            SketchTool::BenzeneRing | SketchTool::CyclohexaneRing | SketchTool::CyclopentaneRing => {
+            SketchTool::BenzeneRing
+            | SketchTool::CyclohexaneRing
+            | SketchTool::CyclopentaneRing => {
                 let sides = match self.tool {
                     SketchTool::CyclopentaneRing => 5,
                     _ => 6,
@@ -282,9 +293,12 @@ impl MoleculeSketcher {
         };
         if let Some(dst) = self.hit_test_atom(pos, view, 14.0) {
             if dst != src {
-                if let Some(existing) = self.mol.bonds.iter_mut().find(|b| {
-                    (b.u == src && b.v == dst) || (b.u == dst && b.v == src)
-                }) {
+                if let Some(existing) = self
+                    .mol
+                    .bonds
+                    .iter_mut()
+                    .find(|b| (b.u == src && b.v == dst) || (b.u == dst && b.v == src))
+                {
                     existing.order = order;
                 } else {
                     let _ = self.mol.add_bond(src, dst, order, BondStereo::None);
@@ -382,7 +396,8 @@ impl MoleculeSketcher {
         let mut ids = Vec::with_capacity(sides);
         for i in 0..sides {
             let ang = (i as f64) * 2.0 * PI / (sides as f64);
-            let id = self.add_free_atom("C", [center[0] + r * ang.cos(), center[1] + r * ang.sin()]);
+            let id =
+                self.add_free_atom("C", [center[0] + r * ang.cos(), center[1] + r * ang.sin()]);
             ids.push(id);
         }
         for i in 0..sides {
@@ -404,12 +419,16 @@ impl MoleculeSketcher {
         let r = 1.5 / (2.0 * (PI / sides as f64).sin());
         let center = [ext[0] + r * dir.cos(), ext[1] + r * dir.sin()];
         let first_id = self.add_free_atom("C", ext);
-        let _ = self.mol.add_bond(aid, first_id, BondOrder::Single, BondStereo::None);
+        let _ = self
+            .mol
+            .add_bond(aid, first_id, BondOrder::Single, BondStereo::None);
         let mut ids = vec![first_id];
         let base_ang = (ext[1] - center[1]).atan2(ext[0] - center[0]);
         for i in 1..sides {
             let ang = base_ang + (i as f64) * 2.0 * PI / (sides as f64);
-            ids.push(self.add_free_atom("C", [center[0] + r * ang.cos(), center[1] + r * ang.sin()]));
+            ids.push(
+                self.add_free_atom("C", [center[0] + r * ang.cos(), center[1] + r * ang.sin()]),
+            );
         }
         for i in 0..sides {
             let order = if aromatic && i % 2 == 0 {
@@ -417,7 +436,9 @@ impl MoleculeSketcher {
             } else {
                 BondOrder::Single
             };
-            let _ = self.mol.add_bond(ids[i], ids[(i + 1) % sides], order, BondStereo::None);
+            let _ = self
+                .mol
+                .add_bond(ids[i], ids[(i + 1) % sides], order, BondStereo::None);
         }
     }
 }
@@ -437,9 +458,15 @@ impl CanvasTransform {
             (0.0, 0.0, 26.0)
         } else {
             let min_x = coords.iter().map(|c| c[0]).fold(f64::INFINITY, f64::min);
-            let max_x = coords.iter().map(|c| c[0]).fold(f64::NEG_INFINITY, f64::max);
+            let max_x = coords
+                .iter()
+                .map(|c| c[0])
+                .fold(f64::NEG_INFINITY, f64::max);
             let min_y = coords.iter().map(|c| c[1]).fold(f64::INFINITY, f64::min);
-            let max_y = coords.iter().map(|c| c[1]).fold(f64::NEG_INFINITY, f64::max);
+            let max_y = coords
+                .iter()
+                .map(|c| c[1])
+                .fold(f64::NEG_INFINITY, f64::max);
             let span_x = (max_x - min_x).max(2.0);
             let span_y = (max_y - min_y).max(2.0);
             let sc = ((f64::from(rect.width()) * 0.72) / span_x)
@@ -471,7 +498,18 @@ impl CanvasTransform {
     }
 }
 
-/// Render a 2D chemical structure inside `rect`.
+/// Render a pre-parsed, pre-laid-out `Molecule` inside `rect` (zero per-frame parsing).
+pub fn draw_cached_molecule_2d(
+    painter: &egui::Painter,
+    mol: &Molecule,
+    rect: Rect,
+    dark_mode: bool,
+) {
+    draw_molecule_in_rect(painter, mol, rect, dark_mode, None);
+}
+
+/// Render a 2D chemical structure inside `rect` (fallback convenience wrapper).
+#[allow(dead_code)]
 pub fn draw_molecule_2d(painter: &egui::Painter, smiles: &str, rect: Rect, dark_mode: bool) {
     let Ok(mut mol) = parse_smiles(smiles) else {
         return;
@@ -512,17 +550,45 @@ fn draw_molecule_in_rect(
         let len = dir.length().max(1e-3);
         let n = Vec2::new(-dir.y / len, dir.x / len) * 2.5;
         match b.order {
-            BondOrder::Single => {
+            BondOrder::Single | BondOrder::Aromatic => {
                 painter.line_segment([p1, p2], Stroke::new(1.6_f32, bond_color));
             }
-            BondOrder::Double | BondOrder::Aromatic => {
+            BondOrder::Double => {
                 painter.line_segment([p1 + n, p2 + n], Stroke::new(1.4_f32, bond_color));
                 painter.line_segment([p1 - n, p2 - n], Stroke::new(1.4_f32, bond_color));
             }
             BondOrder::Triple => {
                 painter.line_segment([p1, p2], Stroke::new(1.3_f32, bond_color));
-                painter.line_segment([p1 + n * 1.4, p2 + n * 1.4], Stroke::new(1.2_f32, bond_color));
-                painter.line_segment([p1 - n * 1.4, p2 - n * 1.4], Stroke::new(1.2_f32, bond_color));
+                painter.line_segment(
+                    [p1 + n * 1.4, p2 + n * 1.4],
+                    Stroke::new(1.2_f32, bond_color),
+                );
+                painter.line_segment(
+                    [p1 - n * 1.4, p2 - n * 1.4],
+                    Stroke::new(1.2_f32, bond_color),
+                );
+            }
+        }
+    }
+
+    // Draw clean inscribed aromatic circle for fully aromatic rings
+    let arom_circle_col = if dark_mode {
+        Color32::from_rgb(175, 180, 190)
+    } else {
+        Color32::from_rgb(65, 65, 75)
+    };
+    for ring in &mol.rings {
+        if ring.len() >= 5 && ring.iter().all(|&aid| mol.atoms[aid].aromatic) {
+            let pts: Vec<Pos2> = ring
+                .iter()
+                .filter_map(|&aid| mol.atoms[aid].coords_2d.map(|c| view.to_screen(c)))
+                .collect();
+            if pts.len() == ring.len() {
+                let rcx = pts.iter().map(|p| p.x).sum::<f32>() / pts.len() as f32;
+                let rcy = pts.iter().map(|p| p.y).sum::<f32>() / pts.len() as f32;
+                let center = Pos2::new(rcx, rcy);
+                let avg_r = pts.iter().map(|p| p.distance(center)).sum::<f32>() / pts.len() as f32;
+                painter.circle_stroke(center, avg_r * 0.56, Stroke::new(1.1_f32, arom_circle_col));
             }
         }
     }

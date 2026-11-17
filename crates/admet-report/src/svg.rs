@@ -1,29 +1,34 @@
-use std::f64::consts::PI;
 use std::fmt::Write as _;
 
-use admet_calc::MoleculeEvaluation;
 use admet_calc::pharmacokinetics::{
     BOILED_EGG_WHITE_ANGLE_RAD, BOILED_EGG_WHITE_AXES, BOILED_EGG_WHITE_CENTER,
     BOILED_EGG_YOLK_ANGLE_RAD, BOILED_EGG_YOLK_AXES, BOILED_EGG_YOLK_CENTER,
 };
+use admet_calc::{BioavailabilityRadar, BoiledEggGeometry, MoleculeEvaluation};
 
-/// Render a 6-axis Bioavailability Radar chart as standalone SVG.
+/// Render a 6-axis Bioavailability Radar chart as standalone SVG using shared radar geometry.
 pub fn render_radar_svg(eval: &MoleculeEvaluation) -> String {
     let w = 280.0;
     let h = 260.0;
     let cx = 140.0;
     let cy = 132.0;
     let max_r = 84.0;
-    let labels = ["LIPO", "SIZE", "POLAR", "INSOLU", "INSATU", "FLEX"];
 
     let mut out = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">\n\
          <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\n"
     );
 
-    // Optimal pink zone between r=0.25 and r=0.85
-    let outer_pts = hex_points(cx, cy, max_r * 0.85);
-    let inner_pts = hex_points(cx, cy, max_r * 0.25);
+    let to_svg = |(ux, uy): (f64, f64)| (cx + ux * max_r, cy - uy * max_r);
+
+    let outer_pts: Vec<(f64, f64)> = BioavailabilityRadar::unit_hexagon(0.85)
+        .into_iter()
+        .map(to_svg)
+        .collect();
+    let inner_pts: Vec<(f64, f64)> = BioavailabilityRadar::unit_hexagon(0.25)
+        .into_iter()
+        .map(to_svg)
+        .collect();
     let _ = writeln!(
         out,
         "<polygon points=\"{}\" fill=\"#fde2e4\" stroke=\"#f4a6b0\" stroke-width=\"1\"/>",
@@ -35,9 +40,11 @@ pub fn render_radar_svg(eval: &MoleculeEvaluation) -> String {
         fmt_pts(&inner_pts)
     );
 
-    // Concentric hexagon grid
     for frac in [0.25, 0.5, 0.75, 1.0] {
-        let pts = hex_points(cx, cy, max_r * frac);
+        let pts: Vec<(f64, f64)> = BioavailabilityRadar::unit_hexagon(frac)
+            .into_iter()
+            .map(to_svg)
+            .collect();
         let _ = writeln!(
             out,
             "<polygon points=\"{}\" fill=\"none\" stroke=\"#d0d0d0\" stroke-width=\"0.8\"/>",
@@ -45,30 +52,28 @@ pub fn render_radar_svg(eval: &MoleculeEvaluation) -> String {
         );
     }
 
-    // Spokes & labels
-    for (i, label) in labels.iter().enumerate() {
-        let ang = -PI / 2.0 + (i as f64) * PI / 3.0;
-        let x2 = cx + max_r * ang.cos();
-        let y2 = cy + max_r * ang.sin();
-        let lx = cx + (max_r + 18.0) * ang.cos();
-        let ly = cy + (max_r + 18.0) * ang.sin() + 4.0;
+    let full_hex = BioavailabilityRadar::unit_hexagon(1.0);
+    let label_hex = BioavailabilityRadar::unit_hexagon((max_r + 18.0) / max_r);
+    for (i, label) in BioavailabilityRadar::AXIS_LABELS.iter().enumerate() {
+        let (x2, y2) = to_svg(full_hex[i]);
+        let (lx, ly) = to_svg(label_hex[i]);
         let _ = writeln!(
             out,
             "<line x1=\"{cx:.1}\" y1=\"{cy:.1}\" x2=\"{x2:.1}\" y2=\"{y2:.1}\" stroke=\"#cccccc\" stroke-width=\"0.8\"/>"
         );
         let _ = writeln!(
             out,
-            "<text x=\"{lx:.1}\" y=\"{ly:.1}\" font-family=\"Helvetica,sans-serif\" font-size=\"10\" font-weight=\"700\" text-anchor=\"middle\" fill=\"#444444\">{label}</text>"
+            "<text x=\"{lx:.1}\" y=\"{:.1}\" font-family=\"Helvetica,sans-serif\" font-size=\"10\" font-weight=\"700\" text-anchor=\"middle\" fill=\"#444444\">{label}</text>",
+            ly + 4.0
         );
     }
 
-    // Molecule polygon
-    let mut mol_pts = Vec::with_capacity(6);
-    for (i, &val) in eval.bioavailability_radar.normalized_axes.iter().enumerate() {
-        let ang = -PI / 2.0 + (i as f64) * PI / 3.0;
-        let r = max_r * val.clamp(0.05, 1.0);
-        mol_pts.push((cx + r * ang.cos(), cy + r * ang.sin()));
-    }
+    let mol_pts: Vec<(f64, f64)> = eval
+        .bioavailability_radar
+        .unit_polygon()
+        .into_iter()
+        .map(to_svg)
+        .collect();
     let _ = writeln!(
         out,
         "<polygon points=\"{}\" fill=\"rgba(217, 72, 72, 0.25)\" stroke=\"#c92a2a\" stroke-width=\"2\"/>",
@@ -85,7 +90,7 @@ pub fn render_radar_svg(eval: &MoleculeEvaluation) -> String {
     out
 }
 
-/// Render an interactive-style BOILED-Egg SVG scatter plot for a batch of evaluations.
+/// Render a BOILED-Egg SVG scatter plot using shared `BoiledEggGeometry`.
 pub fn render_boiled_egg_svg(evals: &[MoleculeEvaluation]) -> String {
     let w = 640.0;
     let h = 440.0;
@@ -96,13 +101,10 @@ pub fn render_boiled_egg_svg(evals: &[MoleculeEvaluation]) -> String {
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
 
-    let tpsa_min = 0.0;
-    let tpsa_max = 200.0;
-    let wlogp_min = -4.0;
-    let wlogp_max = 8.0;
-
-    let map_x = |tpsa: f64| pad_l + ((tpsa - tpsa_min) / (tpsa_max - tpsa_min)) * plot_w;
-    let map_y = |wlogp: f64| pad_t + plot_h - ((wlogp - wlogp_min) / (wlogp_max - wlogp_min)) * plot_h;
+    let map_x = |tpsa: f64| (pad_l + (tpsa / 200.0) * plot_w).clamp(pad_l, pad_l + plot_w);
+    let map_y = |wlogp: f64| {
+        (pad_t + plot_h - ((wlogp + 4.0) / 12.0) * plot_h).clamp(pad_t, pad_t + plot_h)
+    };
 
     let mut out = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">\n\
@@ -110,35 +112,36 @@ pub fn render_boiled_egg_svg(evals: &[MoleculeEvaluation]) -> String {
          <rect x=\"{pad_l}\" y=\"{pad_t}\" width=\"{plot_w}\" height=\"{plot_h}\" fill=\"#d9d9d9\" stroke=\"#555555\" stroke-width=\"1\"/>\n"
     );
 
-    // White ellipse polygon (sampled)
-    let white_pts = sample_ellipse_svg(
+    let white_pts: Vec<(f64, f64)> = BoiledEggGeometry::sample_ellipse(
         BOILED_EGG_WHITE_CENTER,
         BOILED_EGG_WHITE_AXES,
         BOILED_EGG_WHITE_ANGLE_RAD,
-        &map_x,
-        &map_y,
-    );
+        72,
+    )
+    .into_iter()
+    .map(|(x, y)| (map_x(x), map_y(y)))
+    .collect();
     let _ = writeln!(
         out,
         "<polygon points=\"{}\" fill=\"#ffffff\" stroke=\"#888888\" stroke-width=\"1\"/>",
         fmt_pts(&white_pts)
     );
 
-    // Yolk ellipse polygon (sampled)
-    let yolk_pts = sample_ellipse_svg(
+    let yolk_pts: Vec<(f64, f64)> = BoiledEggGeometry::sample_ellipse(
         BOILED_EGG_YOLK_CENTER,
         BOILED_EGG_YOLK_AXES,
         BOILED_EGG_YOLK_ANGLE_RAD,
-        &map_x,
-        &map_y,
-    );
+        72,
+    )
+    .into_iter()
+    .map(|(x, y)| (map_x(x), map_y(y)))
+    .collect();
     let _ = writeln!(
         out,
         "<polygon points=\"{}\" fill=\"#f5c518\" stroke=\"#c99a00\" stroke-width=\"1\"/>",
         fmt_pts(&yolk_pts)
     );
 
-    // Axes ticks
     for t in [0, 40, 80, 120, 160, 200] {
         let x = map_x(f64::from(t));
         let y0 = pad_t + plot_h;
@@ -181,7 +184,6 @@ pub fn render_boiled_egg_svg(evals: &[MoleculeEvaluation]) -> String {
         pad_t + plot_h * 0.5
     );
 
-    // Plot molecules
     let mut out_of_range = 0usize;
     for e in evals {
         if !e.boiled_egg.in_plot_bounds {
@@ -208,7 +210,6 @@ pub fn render_boiled_egg_svg(evals: &[MoleculeEvaluation]) -> String {
         );
     }
 
-    // Legend
     let lx = pad_l + plot_w + 15.0;
     let _ = writeln!(
         out,
@@ -235,37 +236,6 @@ pub fn render_boiled_egg_svg(evals: &[MoleculeEvaluation]) -> String {
 
     let _ = writeln!(out, "</svg>");
     out
-}
-
-fn hex_points(cx: f64, cy: f64, r: f64) -> Vec<(f64, f64)> {
-    (0..6)
-        .map(|i| {
-            let ang = -PI / 2.0 + (i as f64) * PI / 3.0;
-            (cx + r * ang.cos(), cy + r * ang.sin())
-        })
-        .collect()
-}
-
-fn sample_ellipse_svg(
-    center: (f64, f64),
-    axes: (f64, f64),
-    angle: f64,
-    map_x: &dyn Fn(f64) -> f64,
-    map_y: &dyn Fn(f64) -> f64,
-) -> Vec<(f64, f64)> {
-    let steps = 72;
-    let cos_a = angle.cos();
-    let sin_a = angle.sin();
-    (0..steps)
-        .map(|i| {
-            let t = 2.0 * PI * (i as f64) / (steps as f64);
-            let lx = axes.0 * t.cos();
-            let ly = axes.1 * t.sin();
-            let gx = center.0 + lx * cos_a - ly * sin_a;
-            let gy = center.1 + lx * sin_a + ly * cos_a;
-            (map_x(gx).clamp(60.0, 480.0), map_y(gy).clamp(30.0, 390.0))
-        })
-        .collect()
 }
 
 fn fmt_pts(pts: &[(f64, f64)]) -> String {

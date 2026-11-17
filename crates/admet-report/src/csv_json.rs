@@ -2,7 +2,7 @@ use admet_calc::MoleculeEvaluation;
 
 use crate::ReportError;
 
-/// Export a slice of evaluations to SwissADME-compatible CSV string.
+/// Export evaluations to CSV (roundtrip-compatible with `chem_core::parse_csv_batch`).
 pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportError> {
     let mut wtr = csv::Writer::from_writer(Vec::new());
     wtr.write_record([
@@ -18,11 +18,11 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         "#H-bond donors",
         "MR",
         "TPSA",
-        "iLOGP",
-        "XLOGP3",
         "WLOGP",
+        "XLOGP3 (heur.)",
         "MLOGP",
-        "Silicos-IT Log P",
+        "Solvation LogP (exp.)",
+        "Topological LogP (exp.)",
         "Consensus Log P",
         "ESOL Log S",
         "ESOL Solubility (mg/ml)",
@@ -32,18 +32,18 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         "Ali Solubility (mg/ml)",
         "Ali Solubility (mol/l)",
         "Ali Class",
-        "Silicos-IT LogSw",
-        "Silicos-IT Solubility (mg/ml)",
-        "Silicos-IT Solubility (mol/l)",
-        "Silicos-IT Class",
+        "Topological LogS (exp.)",
+        "Topological Solubility (mg/ml)",
+        "Topological Solubility (mol/l)",
+        "Topological Class",
         "GI absorption",
         "BBB permeant",
-        "Pgp substrate",
-        "CYP1A2 inhibitor",
-        "CYP2C19 inhibitor",
-        "CYP2C9 inhibitor",
-        "CYP2D6 inhibitor",
-        "CYP3A4 inhibitor",
+        "Pgp substrate (exp.)",
+        "CYP1A2 inhibitor (exp.)",
+        "CYP2C19 inhibitor (exp.)",
+        "CYP2C9 inhibitor (exp.)",
+        "CYP2D6 inhibitor (exp.)",
+        "CYP3A4 inhibitor (exp.)",
         "log Kp (cm/s)",
         "Lipinski #violations",
         "Ghose #violations",
@@ -51,12 +51,13 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         "Egan #violations",
         "Muegge #violations",
         "Bioavailability Score",
-        "PAINS #alerts",
+        "PAINS #alerts (26 checked)",
         "PAINS alerts",
-        "Brenk #alerts",
+        "Brenk #alerts (25 checked)",
         "Brenk alerts",
         "Leadlikeness #violations",
-        "Synthetic Accessibility",
+        "Synthetic Accessibility (proxy)",
+        "Warnings",
     ])?;
 
     for e in evals {
@@ -68,6 +69,7 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         let mc = &e.medicinal_chemistry;
         let pains_str = mc.pains_alerts.join("; ");
         let brenk_str = mc.brenk_alerts.join("; ");
+        let warn_str = e.warnings.join("; ");
         wtr.write_record(&[
             e.name.clone(),
             e.canonical_smiles.clone(),
@@ -81,11 +83,11 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
             p.h_bond_donors.to_string(),
             format!("{:.2}", p.molar_refractivity),
             format!("{:.2}", p.tpsa),
-            format!("{:.2}", l.ilogp),
-            format!("{:.2}", l.xlogp3),
             format!("{:.2}", l.wlogp),
+            format!("{:.2}", l.xlogp3),
             format!("{:.2}", l.mlogp),
-            format!("{:.2}", l.silicos_it),
+            format!("{:.2}", l.solvation_logp_est),
+            format!("{:.2}", l.topological_logp_est),
             format!("{:.2}", l.consensus_log_p),
             format!("{:.2}", w.esol.log_s),
             format!("{:.2e}", w.esol.solubility_mg_ml),
@@ -95,10 +97,10 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
             format!("{:.2e}", w.ali.solubility_mg_ml),
             format!("{:.2e}", w.ali.solubility_mol_l),
             w.ali.class.as_str().to_string(),
-            format!("{:.2}", w.silicos_it.log_s),
-            format!("{:.2e}", w.silicos_it.solubility_mg_ml),
-            format!("{:.2e}", w.silicos_it.solubility_mol_l),
-            w.silicos_it.class.as_str().to_string(),
+            format!("{:.2}", w.topological_est.log_s),
+            format!("{:.2e}", w.topological_est.solubility_mg_ml),
+            format!("{:.2e}", w.topological_est.solubility_mol_l),
+            w.topological_est.class.as_str().to_string(),
             pk.gi_absorption.as_str().to_string(),
             yes_no(pk.bbb_permeant).to_string(),
             yes_no(pk.pgp_substrate).to_string(),
@@ -120,6 +122,7 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
             brenk_str,
             mc.leadlikeness.violations.to_string(),
             format!("{:.2}", mc.synthetic_accessibility),
+            warn_str,
         ])?;
     }
 

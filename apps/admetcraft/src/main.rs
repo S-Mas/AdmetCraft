@@ -3,16 +3,21 @@
 mod charts;
 mod sketcher;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use admet_calc::MoleculeEvaluation;
-use admet_engine::{AdmetSession, Command, CommandRegistry, FilterCriteria};
-use admet_report::{ExportFormat, write_report_file};
+use admet_engine::{
+    AdmetSession, Command, CommandRegistry, FilterCriteria, MAX_READ_BYTES, PathSandbox,
+};
+use admet_report::{ExportFormat, write_report_to_writer};
+use chem_core::{Molecule, ensure_2d_coords, parse_smiles};
 use eframe::egui;
 use egui::{Color32, RichText, Sense, Vec2};
 
 use charts::{draw_bioavailability_radar, draw_boiled_egg_interactive};
-use sketcher::{MoleculeSketcher, draw_molecule_2d};
+use sketcher::{MoleculeSketcher, draw_cached_molecule_2d};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainTab {
@@ -23,6 +28,7 @@ enum MainTab {
 
 struct AdmetCraftApp {
     session: AdmetSession,
+    mol_cache: HashMap<String, Molecule>,
     sketcher: MoleculeSketcher,
     active_tab: MainTab,
     dark_mode: bool,
@@ -32,6 +38,7 @@ struct AdmetCraftApp {
     import_path: String,
     export_dir: String,
     status_msg: String,
+    async_status: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for AdmetCraftApp {
@@ -48,8 +55,9 @@ impl Default for AdmetCraftApp {
         if let Some(first) = session.evaluations.first() {
             let _ = sketcher.load_smiles(&first.canonical_smiles);
         }
-        Self {
+        let mut app = Self {
             session,
+            mol_cache: HashMap::new(),
             sketcher,
             active_tab: MainTab::Cards,
             dark_mode: false,
@@ -59,39 +67,100 @@ impl Default for AdmetCraftApp {
             import_path: String::new(),
             export_dir,
             status_msg,
-        }
+            async_status: Arc::new(Mutex::new(None)),
+        };
+        app.rebuild_mol_cache();
+        app
     }
 }
 
 impl AdmetCraftApp {
+    fn rebuild_mol_cache(&mut self) {
+        self.mol_cache.clear();
+        for ev in &self.session.evaluations {
+            if self.mol_cache.contains_key(&ev.canonical_smiles) {
+                continue;
+            }
+            if let Ok(mut mol) = parse_smiles(&ev.canonical_smiles) {
+                ensure_2d_coords(&mut mol);
+                self.mol_cache.insert(ev.canonical_smiles.clone(), mol);
+            }
+        }
+    }
+
     fn run_command(&mut self, cmd: Command) {
         match CommandRegistry::execute(&mut self.session, cmd) {
-            Ok(out) => self.status_msg = out.message,
+            Ok(out) => {
+                self.status_msg = out.message;
+                self.rebuild_mol_cache();
+            }
             Err(e) => self.status_msg = format!("Error: {e}"),
         }
     }
 
+    /// Export asynchronously on a background thread using `PathSandbox::open_write` so the UI
+    /// thread never freezes on large PDFs and symlink/traversal escapes are blocked.
     fn export(&mut self, format: ExportFormat, filename: &str) {
         if self.session.evaluations.is_empty() {
             self.status_msg = "No molecules to export".to_string();
             return;
         }
-        let path = PathBuf::from(&self.export_dir).join(filename);
-        match write_report_file(&self.session.evaluations, &path, format) {
-            Ok(()) => self.status_msg = format!("Exported {}", path.display()),
-            Err(e) => self.status_msg = format!("Export error: {e}"),
-        }
-    }
-
-    fn import_file_path(&mut self, path: &std::path::Path) {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
+        let export_root = PathBuf::from(&self.export_dir);
+        let sandbox = match PathSandbox::new(None, Some(&export_root)) {
+            Ok(sb) => sb,
             Err(e) => {
-                self.status_msg = format!("Failed to read {}: {e}", path.display());
+                self.status_msg = format!("Export directory error: {e}");
                 return;
             }
         };
-        let ext = path
+        let target_name = PathBuf::from(filename);
+        let evals = self.session.evaluations.clone();
+        let status_slot = Arc::clone(&self.async_status);
+        self.status_msg = format!("Exporting {filename} in background...");
+
+        std::thread::spawn(move || {
+            let msg = match sandbox.open_write(&target_name) {
+                Ok((resolved, mut file)) => match write_report_to_writer(&evals, &mut file, format)
+                {
+                    Ok(()) => format!("Exported {}", resolved.display()),
+                    Err(e) => format!("Export error: {e}"),
+                },
+                Err(e) => format!("Sandbox export error: {e}"),
+            };
+            if let Ok(mut guard) = status_slot.lock() {
+                *guard = Some(msg);
+            }
+        });
+    }
+
+    /// Import a `.smi`, `.csv`, or `.sdf` file inside `export_dir` (or the file's parent for
+    /// explicit drag-and-drop) using `PathSandbox::read_to_string_limited` (rejects symlinks/FIFOs).
+    fn import_file_path(&mut self, path: &Path, from_drop: bool) {
+        let root = if from_drop {
+            path.parent().unwrap_or_else(|| Path::new("."))
+        } else {
+            Path::new(&self.export_dir)
+        };
+        let sandbox = match PathSandbox::new(Some(root), None) {
+            Ok(sb) => sb,
+            Err(e) => {
+                self.status_msg = format!("Import root error: {e}");
+                return;
+            }
+        };
+        let rel_or_abs = if from_drop {
+            path.file_name().map(Path::new).unwrap_or(path)
+        } else {
+            path
+        };
+        let (resolved, content) = match sandbox.read_to_string_limited(rel_or_abs, MAX_READ_BYTES) {
+            Ok(res) => res,
+            Err(e) => {
+                self.status_msg = format!("Sandbox import error: {e}");
+                return;
+            }
+        };
+        let ext = resolved
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
@@ -107,6 +176,7 @@ impl AdmetCraftApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let wants_kb = ctx.wants_keyboard_input();
         let mut open_palette = false;
         let mut run_batch = false;
         let mut do_undo = false;
@@ -118,10 +188,11 @@ impl AdmetCraftApp {
             if i.modifiers.ctrl && i.key_pressed(egui::Key::Enter) {
                 run_batch = true;
             }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
+            // Only intercept Ctrl+Z / Ctrl+Y for session undo when no TextEdit has focus
+            if !wants_kb && i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
                 do_undo = true;
             }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::Y) {
+            if !wants_kb && i.modifiers.ctrl && i.key_pressed(egui::Key::Y) {
                 do_redo = true;
             }
         });
@@ -140,7 +211,6 @@ impl AdmetCraftApp {
             self.run_command(Command::Redo);
         }
 
-        // Support drag-and-drop .smi / .csv / .sdf files
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -149,7 +219,7 @@ impl AdmetCraftApp {
                 .collect()
         });
         for p in dropped {
-            self.import_file_path(&p);
+            self.import_file_path(&p, true);
         }
     }
 
@@ -184,16 +254,22 @@ impl AdmetCraftApp {
                         }
                         ui.horizontal(|ui| {
                             if ui
-                                .selectable_label(false, format!("[{}] {}", desc.category, desc.title))
+                                .selectable_label(
+                                    false,
+                                    format!("[{}] {}", desc.category, desc.title),
+                                )
                                 .clicked()
                             {
                                 exec_id = Some(desc.id);
                                 close = true;
                             }
                             if !desc.shortcut.is_empty() {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.weak(desc.shortcut);
-                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.weak(desc.shortcut);
+                                    },
+                                );
                             }
                         });
                     }
@@ -245,6 +321,12 @@ impl AdmetCraftApp {
 
 impl eframe::App for AdmetCraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Ok(mut guard) = self.async_status.lock()
+            && let Some(msg) = guard.take()
+        {
+            self.status_msg = msg;
+        }
+
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
         } else {
@@ -254,15 +336,18 @@ impl eframe::App for AdmetCraftApp {
         self.handle_shortcuts(ctx);
         self.render_palette(ctx);
 
-        // Top toolbar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading(RichText::new("AdmetCraft").strong());
-                ui.label(RichText::new("Local-First SwissADME").weak());
+                ui.label(RichText::new("Local-First ADMET Workbench").weak());
                 ui.separator();
 
                 if ui
-                    .button(RichText::new("▶ Run!").strong().color(Color32::from_rgb(180, 40, 40)))
+                    .button(
+                        RichText::new("▶ Run!")
+                            .strong()
+                            .color(Color32::from_rgb(180, 40, 40)),
+                    )
                     .clicked()
                 {
                     let input = self.session.smiles_input.clone();
@@ -302,7 +387,7 @@ impl eframe::App for AdmetCraftApp {
                 }
                 ui.separator();
                 if ui
-                    .button(if self.dark_mode { "☀ Light" } else { "🌙 Dark" })
+                    .button(if self.dark_mode { "Light" } else { "Dark" })
                     .clicked()
                 {
                     self.dark_mode = !self.dark_mode;
@@ -314,7 +399,6 @@ impl eframe::App for AdmetCraftApp {
             });
         });
 
-        // Bottom status bar
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -327,14 +411,13 @@ impl eframe::App for AdmetCraftApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.export_dir)
                             .desired_width(180.0)
-                            .hint_text("Export folder"),
+                            .hint_text("Sandbox dir"),
                     );
-                    ui.label("Export dir:");
+                    ui.label("Sandbox dir:");
                 });
             });
         });
 
-        // Left input & 2D sketcher panel
         egui::SidePanel::left("input_panel")
             .resizable(true)
             .default_width(360.0)
@@ -380,16 +463,16 @@ impl eframe::App for AdmetCraftApp {
                     );
 
                     ui.separator();
-                    ui.strong("Import .smi / .csv / .sdf (or drag & drop)");
+                    ui.strong("Import .smi / .csv / .sdf (sandboxed or drag & drop)");
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.import_path)
                                 .desired_width(210.0)
-                                .hint_text("/path/to/molecules.smi"),
+                                .hint_text("molecules.smi"),
                         );
                         if ui.button("Load").clicked() && !self.import_path.trim().is_empty() {
                             let p = PathBuf::from(self.import_path.trim());
-                            self.import_file_path(&p);
+                            self.import_file_path(&p, false);
                         }
                     });
 
@@ -406,7 +489,6 @@ impl eframe::App for AdmetCraftApp {
                 });
             });
 
-        // Central results panel
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.active_tab, MainTab::Cards, "Molecule Cards");
@@ -466,6 +548,7 @@ impl eframe::App for AdmetCraftApp {
                     if let Some(clicked) = draw_boiled_egg_interactive(
                         ui,
                         &self.session.evaluations,
+                        &self.mol_cache,
                         self.show_egg_names,
                         self.session.selected_index,
                         self.dark_mode,
@@ -485,18 +568,19 @@ impl eframe::App for AdmetCraftApp {
 
 impl AdmetCraftApp {
     fn render_cards_tab(&mut self, ui: &mut egui::Ui) {
-        // Horizontal molecule selector chips
         let mut next_selected: Option<usize> = None;
-        egui::ScrollArea::horizontal().id_salt("mol_chips").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (idx, ev) in self.session.evaluations.iter().enumerate() {
-                    let is_sel = self.session.selected_index == Some(idx);
-                    if ui.selectable_label(is_sel, &ev.name).clicked() {
-                        next_selected = Some(idx);
+        egui::ScrollArea::horizontal()
+            .id_salt("mol_chips")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (idx, ev) in self.session.evaluations.iter().enumerate() {
+                        let is_sel = self.session.selected_index == Some(idx);
+                        if ui.selectable_label(is_sel, &ev.name).clicked() {
+                            next_selected = Some(idx);
+                        }
                     }
-                }
+                });
             });
-        });
         if let Some(idx) = next_selected {
             self.session.selected_index = Some(idx);
             if let Some(ev) = self.session.evaluations.get(idx) {
@@ -510,43 +594,57 @@ impl AdmetCraftApp {
             return;
         };
 
-        egui::ScrollArea::vertical().id_salt("card_body").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(&eval.name);
-                ui.label(format!("({})", eval.physicochemical.formula));
-                if ui.small_button("Load into Sketcher").clicked() {
-                    let _ = self.sketcher.load_smiles(&eval.canonical_smiles);
+        egui::ScrollArea::vertical()
+            .id_salt("card_body")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(&eval.name);
+                    ui.label(format!("({})", eval.physicochemical.formula));
+                    if ui.small_button("Load into Sketcher").clicked() {
+                        let _ = self.sketcher.load_smiles(&eval.canonical_smiles);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Canonical SMILES:");
+                    ui.monospace(&eval.canonical_smiles);
+                });
+                if !eval.warnings.is_empty() {
+                    for w in &eval.warnings {
+                        ui.colored_label(Color32::from_rgb(180, 95, 10), format!("Note: {w}"));
+                    }
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Canonical SMILES:");
-                ui.monospace(&eval.canonical_smiles);
-            });
-            ui.add_space(6.0);
+                ui.add_space(6.0);
 
-            // Top visual row: 2D Structure + 6-axis Bioavailability Radar
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.strong("2D Structure");
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(260.0, 220.0), Sense::hover());
-                    let bg = if self.dark_mode {
-                        Color32::from_rgb(30, 32, 36)
-                    } else {
-                        Color32::WHITE
-                    };
-                    ui.painter_at(rect).rect_filled(rect, 4.0, bg);
-                    draw_molecule_2d(&ui.painter_at(rect), &eval.canonical_smiles, rect, self.dark_mode);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.strong("2D Structure");
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::new(260.0, 220.0), Sense::hover());
+                        let bg = if self.dark_mode {
+                            Color32::from_rgb(30, 32, 36)
+                        } else {
+                            Color32::WHITE
+                        };
+                        ui.painter_at(rect).rect_filled(rect, 4.0, bg);
+                        if let Some(mol) = self.mol_cache.get(&eval.canonical_smiles) {
+                            draw_cached_molecule_2d(
+                                &ui.painter_at(rect),
+                                mol,
+                                rect,
+                                self.dark_mode,
+                            );
+                        }
+                    });
+                    ui.add_space(16.0);
+                    ui.vertical(|ui| {
+                        ui.strong("Bioavailability Radar");
+                        draw_bioavailability_radar(ui, &eval, 220.0, self.dark_mode);
+                    });
                 });
-                ui.add_space(16.0);
-                ui.vertical(|ui| {
-                    ui.strong("Bioavailability Radar");
-                    draw_bioavailability_radar(ui, &eval, 220.0, self.dark_mode);
-                });
-            });
 
-            ui.add_space(8.0);
-            render_six_sections(ui, &eval);
-        });
+                ui.add_space(8.0);
+                render_six_sections(ui, &eval);
+            });
     }
 
     fn render_table_tab(&mut self, ui: &mut egui::Ui) {
@@ -565,10 +663,10 @@ impl AdmetCraftApp {
                         "ESOL LogS",
                         "GI",
                         "BBB",
-                        "P-gp",
+                        "P-gp (exp.)",
                         "Lipinski",
                         "PAINS",
-                        "SA",
+                        "SA (proxy)",
                     ] {
                         ui.strong(h);
                     }
@@ -594,8 +692,15 @@ impl AdmetCraftApp {
                             yes_no(e.druglikeness.lipinski.pass),
                             e.druglikeness.lipinski.violations
                         ));
-                        ui.label(e.medicinal_chemistry.pains_alerts.len().to_string());
-                        ui.label(format!("{:.2}", e.medicinal_chemistry.synthetic_accessibility));
+                        ui.label(format!(
+                            "{}/{}",
+                            e.medicinal_chemistry.pains_alerts.len(),
+                            e.medicinal_chemistry.pains_catalog_size
+                        ));
+                        ui.label(format!(
+                            "{:.2}",
+                            e.medicinal_chemistry.synthetic_accessibility
+                        ));
                         ui.end_row();
                     }
                 });
@@ -626,7 +731,10 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                 "phys_grid",
                 &[
                     ("Formula", p.formula.clone()),
-                    ("Molecular weight", format!("{:.2} g/mol", p.molecular_weight)),
+                    (
+                        "Molecular weight",
+                        format!("{:.2} g/mol", p.molecular_weight),
+                    ),
                     ("Num. heavy atoms", p.heavy_atoms.to_string()),
                     ("Num. arom. heavy atoms", p.aromatic_heavy_atoms.to_string()),
                     ("Fraction Csp3", format!("{:.2}", p.fraction_csp3)),
@@ -646,12 +754,21 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                 ui,
                 "lipo_grid",
                 &[
-                    ("Log Po/w (iLOGP)", format!("{:.2}", l.ilogp)),
-                    ("Log Po/w (XLOGP3)", format!("{:.2}", l.xlogp3)),
                     ("Log Po/w (WLOGP)", format!("{:.2}", l.wlogp)),
+                    ("Log Po/w (XLOGP3 heur.)", format!("{:.2}", l.xlogp3)),
                     ("Log Po/w (MLOGP)", format!("{:.2}", l.mlogp)),
-                    ("Log Po/w (SILICOS-IT)", format!("{:.2}", l.silicos_it)),
-                    ("Consensus Log Po/w", format!("{:.2}", l.consensus_log_p)),
+                    (
+                        "Solvation est. (exp.)",
+                        format!("{:.2}", l.solvation_logp_est),
+                    ),
+                    (
+                        "Topological est. (exp.)",
+                        format!("{:.2}", l.topological_logp_est),
+                    ),
+                    (
+                        "Consensus Log Po/w (3-model)",
+                        format!("{:.2}", l.consensus_log_p),
+                    ),
                 ],
             );
         });
@@ -684,13 +801,13 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                         ),
                     ),
                     (
-                        "Log S (SILICOS-IT)",
+                        "Log S (Topo exp.)",
                         format!(
                             "{:.2} | {:.2e} mg/ml; {:.2e} mol/l | {}",
-                            w.silicos_it.log_s,
-                            w.silicos_it.solubility_mg_ml,
-                            w.silicos_it.solubility_mol_l,
-                            w.silicos_it.class.as_str()
+                            w.topological_est.log_s,
+                            w.topological_est.solubility_mg_ml,
+                            w.topological_est.solubility_mol_l,
+                            w.topological_est.class.as_str()
                         ),
                     ),
                 ],
@@ -706,13 +823,34 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                 &[
                     ("GI absorption", pk.gi_absorption.as_str().to_string()),
                     ("BBB permeant", yes_no(pk.bbb_permeant).to_string()),
-                    ("P-gp substrate", yes_no(pk.pgp_substrate).to_string()),
-                    ("CYP1A2 inhibitor", yes_no(pk.cyp1a2_inhibitor).to_string()),
-                    ("CYP2C19 inhibitor", yes_no(pk.cyp2c19_inhibitor).to_string()),
-                    ("CYP2C9 inhibitor", yes_no(pk.cyp2c9_inhibitor).to_string()),
-                    ("CYP2D6 inhibitor", yes_no(pk.cyp2d6_inhibitor).to_string()),
-                    ("CYP3A4 inhibitor", yes_no(pk.cyp3a4_inhibitor).to_string()),
-                    ("Log Kp (skin permeation)", format!("{:.2} cm/s", pk.log_kp_cm_s)),
+                    (
+                        "P-gp substrate (exp. heur.)",
+                        yes_no(pk.pgp_substrate).to_string(),
+                    ),
+                    (
+                        "CYP1A2 inhibitor (exp. heur.)",
+                        yes_no(pk.cyp1a2_inhibitor).to_string(),
+                    ),
+                    (
+                        "CYP2C19 inhibitor (exp. heur.)",
+                        yes_no(pk.cyp2c19_inhibitor).to_string(),
+                    ),
+                    (
+                        "CYP2C9 inhibitor (exp. heur.)",
+                        yes_no(pk.cyp2c9_inhibitor).to_string(),
+                    ),
+                    (
+                        "CYP2D6 inhibitor (exp. heur.)",
+                        yes_no(pk.cyp2d6_inhibitor).to_string(),
+                    ),
+                    (
+                        "CYP3A4 inhibitor (exp. heur.)",
+                        yes_no(pk.cyp3a4_inhibitor).to_string(),
+                    ),
+                    (
+                        "Log Kp (skin permeation)",
+                        format!("{:.2} cm/s", pk.log_kp_cm_s),
+                    ),
                 ],
             );
         });
@@ -729,7 +867,10 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                     ("Veber", fmt_rule(&d.veber)),
                     ("Egan", fmt_rule(&d.egan)),
                     ("Muegge", fmt_rule(&d.muegge)),
-                    ("Bioavailability Score", format!("{:.2}", d.bioavailability_score)),
+                    (
+                        "Bioavailability Score",
+                        format!("{:.2}", d.bioavailability_score),
+                    ),
                 ],
             );
         });
@@ -738,14 +879,30 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
         .default_open(true)
         .show(ui, |ui| {
             let pains_txt = if mc.pains_alerts.is_empty() {
-                "0 alerts".to_string()
+                format!(
+                    "0 alerts ({} curated patterns checked)",
+                    mc.pains_catalog_size
+                )
             } else {
-                format!("{} alert(s): {}", mc.pains_alerts.len(), mc.pains_alerts.join(", "))
+                format!(
+                    "{}/{} alert(s): {}",
+                    mc.pains_alerts.len(),
+                    mc.pains_catalog_size,
+                    mc.pains_alerts.join(", ")
+                )
             };
             let brenk_txt = if mc.brenk_alerts.is_empty() {
-                "0 alerts".to_string()
+                format!(
+                    "0 alerts ({} curated patterns checked)",
+                    mc.brenk_catalog_size
+                )
             } else {
-                format!("{} alert(s): {}", mc.brenk_alerts.len(), mc.brenk_alerts.join(", "))
+                format!(
+                    "{}/{} alert(s): {}",
+                    mc.brenk_alerts.len(),
+                    mc.brenk_catalog_size,
+                    mc.brenk_alerts.join(", ")
+                )
             };
             kv_grid(
                 ui,
@@ -754,7 +911,10 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                     ("PAINS", pains_txt),
                     ("Brenk", brenk_txt),
                     ("Leadlikeness", fmt_rule(&mc.leadlikeness)),
-                    ("Synthetic accessibility", format!("{:.2}", mc.synthetic_accessibility)),
+                    (
+                        "SA score (heuristic proxy)",
+                        format!("{:.2}", mc.synthetic_accessibility),
+                    ),
                 ],
             );
         });
@@ -793,7 +953,7 @@ fn yes_no(b: bool) -> &'static str {
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("AdmetCraft — Local-First ADMET Suite")
+            .with_title("AdmetCraft — Local-First ADMET Workbench")
             .with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
