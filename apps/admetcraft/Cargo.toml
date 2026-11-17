@@ -1,0 +1,16 @@
+[package]
+name = "admetcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chem-core = { path = "../../crates/chem-core" }
+admet-calc = { path = "../../crates/admet-calc" }
+admet-report = { path = "../../crates/admet-report" }
+admet-engine = { path = "../../crates/admet-engine" }
+eframe.workspace = true
+egui.workspace = true

@@ -1,0 +1,29 @@
+# Maintainer: S-Mas
+pkgname=admetcraft
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Local-first pure-Rust ADMET, physicochemical and druglikeness suite"
+arch=('x86_64')
+license=('MIT' 'Apache-2.0')
+depends=('gcc-libs' 'glibc' 'wayland' 'libxkbcommon' 'mesa')
+makedepends=('rust' 'cargo')
+source=()
+
+build() {
+  cd "$startdir/.."
+  cargo build --workspace --release --locked
+}
+
+check() {
+  cd "$startdir/.."
+  cargo test --workspace --locked
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 "target/release/admetcraft" "$pkgdir/usr/bin/admetcraft"
+  install -Dm755 "target/release/admetcraft-cli" "$pkgdir/usr/bin/admetcraft-cli"
+  install -Dm644 "packaging/admetcraft.desktop" "$pkgdir/usr/share/applications/admetcraft.desktop"
+  install -Dm644 "packaging/admetcraft.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/admetcraft.svg"
+  install -Dm644 "LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+}

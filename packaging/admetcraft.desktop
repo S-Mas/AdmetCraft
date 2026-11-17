@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AdmetCraft
+Comment=Local-First ADMET, Physicochemical & Druglikeness Workbench
+Exec=admetcraft
+Icon=admetcraft
+Terminal=false
+Categories=Science;Chemistry;Education;
+Keywords=ADMET;SMILES;Cheminformatics;SwissADME;
+StartupNotify=true
