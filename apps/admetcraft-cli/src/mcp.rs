@@ -5,8 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use admet_calc::{MoleculeEvaluation, compare_smiles, evaluate_batch, evaluate_smiles};
+use admet_calc::{MoleculeEvaluation, TppPreset};
 use admet_engine::{FilterCriteria, MAX_READ_BYTES, PathSandbox};
+use admet_qsar::{
+    compare_smiles_auto, evaluate_batch_auto, evaluate_smiles_auto, load_default_model_pack,
+};
 use admet_report::{ExportFormat, write_report_to_writer};
 use chem_core::{parse_csv_batch, parse_sdf, parse_smiles, parse_smiles_batch};
 use serde::Serialize;
@@ -656,6 +659,24 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["written_path", "format", "exported_count", "errors"]
             }
+        },
+        {
+            "name": "model_info",
+            "description": "Return held-out Bemis-Murcko scaffold-split validation metrics and 90% conformal coverage for the installed local TDC QSAR model pack.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "loaded": { "type": "boolean" },
+                    "version": { "type": "string" },
+                    "endpoint_count": { "type": "integer" },
+                    "endpoints": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["loaded", "endpoint_count"]
+            }
         }
     ])
 }
@@ -686,7 +707,64 @@ fn call_tool(name: &str, args: &Value, sandbox: &PathSandbox) -> Result<Value, S
         "inspect_molecule" => tool_inspect_molecule(args),
         "compare_molecules" => tool_compare_molecules(args),
         "export_report" => tool_export_report(args, sandbox),
+        "model_info" => tool_model_info(),
         other => Err(format!("invalid params: unknown tool '{other}'")),
+    }
+}
+
+fn parse_tpp_preset(args: &Value) -> TppPreset {
+    match args
+        .get("tpp_preset")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("cns") => TppPreset::CnsPenetrant,
+        Some("peripheral") => TppPreset::PeripheralSelective,
+        Some("oncology") => TppPreset::OncologyKinase,
+        _ => TppPreset::OralSmallMolecule,
+    }
+}
+
+fn tool_model_info() -> Result<Value, String> {
+    if let Some(pack) = load_default_model_pack() {
+        let eps: Vec<Value> = pack
+            .models
+            .iter()
+            .map(|m| {
+                json!({
+                    "endpoint_id": m.endpoint_id,
+                    "display_name": m.display_name,
+                    "category": m.category,
+                    "metrics": m.metrics,
+                })
+            })
+            .collect();
+        let summary = format!(
+            "Loaded AdmetCraft TDC QSAR pack v{} ({} endpoints)",
+            pack.version,
+            pack.models.len()
+        );
+        Ok(tool_ok(
+            summary,
+            json!({
+                "loaded": true,
+                "version": pack.version,
+                "split_method": pack.split_method,
+                "endpoint_count": pack.models.len(),
+                "endpoints": eps,
+            }),
+        ))
+    } else {
+        Ok(tool_ok(
+            "No local TDC QSAR model pack installed yet (run `admetcraft-cli train-qsar`)."
+                .to_string(),
+            json!({
+                "loaded": false,
+                "endpoint_count": 0,
+                "endpoints": [],
+            }),
+        ))
     }
 }
 
@@ -795,7 +873,7 @@ fn parse_optional_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a st
     }
 }
 
-fn eval_lines(lines: &[String]) -> (Vec<MoleculeEvaluation>, Vec<Value>) {
+fn eval_lines(lines: &[String], tpp: TppPreset) -> (Vec<MoleculeEvaluation>, Vec<Value>) {
     let joined = lines.join("\n");
     let parsed = parse_smiles_batch(&joined);
     let mut mols = Vec::new();
@@ -806,10 +884,11 @@ fn eval_lines(lines: &[String]) -> (Vec<MoleculeEvaluation>, Vec<Value>) {
             Err(e) => errors.push(json!({ "line": line_no, "input": raw, "error": e.to_string() })),
         }
     }
-    (evaluate_batch(&mols), errors)
+    (evaluate_batch_auto(&mols, tpp), errors)
 }
 
 fn tool_evaluate_smiles(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    let tpp = parse_tpp_preset(args);
     if let Some(file_val) = args.get("file")
         && !file_val.is_null()
     {
@@ -863,7 +942,7 @@ fn tool_evaluate_smiles(args: &Value, sandbox: &PathSandbox) -> Result<Value, St
                 }
             }
         }
-        let evals = evaluate_batch(&mols);
+        let evals = evaluate_batch_auto(&mols, tpp);
         let summary = format!(
             "Evaluated {} molecule(s) from {}",
             evals.len(),
@@ -890,7 +969,7 @@ fn tool_evaluate_smiles(args: &Value, sandbox: &PathSandbox) -> Result<Value, St
                 .to_string(),
         );
     }
-    let (evals, errors) = eval_lines(&lines);
+    let (evals, errors) = eval_lines(&lines, tpp);
     let summary = format!(
         "Evaluated {} molecule(s) ({} error(s))",
         evals.len(),
@@ -927,7 +1006,7 @@ fn tool_filter_druglikeness(args: &Value) -> Result<Value, String> {
         no_ames: parse_optional_bool(args, "no_ames")?.unwrap_or(false),
         no_dili: parse_optional_bool(args, "no_dili")?.unwrap_or(false),
     };
-    let (evals, errors) = eval_lines(&lines);
+    let (evals, errors) = eval_lines(&lines, parse_tpp_preset(args));
     let total = evals.len();
     let passed: Vec<MoleculeEvaluation> =
         evals.into_iter().filter(|e| criteria.matches(e)).collect();
@@ -958,7 +1037,7 @@ fn tool_inspect_molecule(args: &Value) -> Result<Value, String> {
         Err(e) => return Ok(tool_err(format!("invalid SMILES: {e}"))),
     };
     chem_core::generate_2d_coords(&mut mol);
-    let eval = match evaluate_smiles(smi, name) {
+    let eval = match evaluate_smiles_auto(smi, name, parse_tpp_preset(args)) {
         Ok(e) => e,
         Err(e) => return Ok(tool_err(format!("evaluation failed: {e}"))),
     };
@@ -977,6 +1056,9 @@ fn tool_inspect_molecule(args: &Value) -> Result<Value, String> {
             "cns_mpo": eval.druglikeness.cns_mpo,
             "ionization": eval.ionization,
             "safety": eval.safety,
+            "qsar": eval.qsar,
+            "metabolism_sites": eval.metabolism_sites,
+            "tpp_mpo": eval.tpp_mpo,
             "warnings": eval.warnings,
             "heavy_atoms": mol.heavy_atom_count(),
             "aromatic_heavy_atoms": mol.aromatic_heavy_atom_count(),
@@ -1011,7 +1093,7 @@ fn tool_compare_molecules(args: &Value) -> Result<Value, String> {
     };
     let name_a = parse_optional_string(args, "name_a")?;
     let name_b = parse_optional_string(args, "name_b")?;
-    let cmp = match compare_smiles(smi_a, name_a, smi_b, name_b) {
+    let cmp = match compare_smiles_auto(smi_a, name_a, smi_b, name_b, parse_tpp_preset(args)) {
         Ok(c) => c,
         Err(e) => return Ok(tool_err(format!("comparison failed: {e}"))),
     };
@@ -1066,7 +1148,7 @@ fn tool_export_report(args: &Value, sandbox: &PathSandbox) -> Result<Value, Stri
         }
     };
 
-    let (evals, errors) = eval_lines(&lines);
+    let (evals, errors) = eval_lines(&lines, parse_tpp_preset(args));
     if evals.is_empty() {
         return Ok(tool_err("no valid molecules to export"));
     }

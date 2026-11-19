@@ -4,17 +4,42 @@ mod mcp;
 
 use std::path::PathBuf;
 
-use admet_calc::{MoleculeEvaluation, compare_smiles, evaluate_batch, evaluate_smiles};
+use admet_calc::{MoleculeEvaluation, QsarTaskKind, TppPreset};
 use admet_engine::{MAX_READ_BYTES, PathSandbox};
+use admet_qsar::{
+    AdmetModelPack, GbdtTrainConfig, compare_smiles_auto, default_model_pack_path,
+    evaluate_batch_auto, evaluate_smiles_auto, load_default_model_pack, tdc_raw_dir,
+    train_tdc_model_pack,
+};
 use admet_report::{ExportFormat, write_report_file, write_report_to_writer};
 use chem_core::{parse_csv_batch, parse_sdf, parse_smiles_batch};
 use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum CliTpp {
+    #[default]
+    Oral,
+    Cns,
+    Peripheral,
+    Oncology,
+}
+
+impl From<CliTpp> for TppPreset {
+    fn from(value: CliTpp) -> Self {
+        match value {
+            CliTpp::Oral => TppPreset::OralSmallMolecule,
+            CliTpp::Cns => TppPreset::CnsPenetrant,
+            CliTpp::Peripheral => TppPreset::PeripheralSelective,
+            CliTpp::Oncology => TppPreset::OncologyKinase,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "admetcraft-cli",
     version,
-    about = "Local-first pure-Rust ADMET calculator and MCP server"
+    about = "Local-first pure-Rust ADMET, TDC QSAR (90% Conformal CI + AD), SoM & TPP MPO calculator and MCP server"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,21 +48,27 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Evaluate a single SMILES string and print complete ADMET JSON.
+    /// Evaluate a single SMILES string and print complete ADMET + QSAR + SoM + TPP MPO JSON.
     Eval {
         /// SMILES string (or "SMILES Name").
         smiles: String,
         /// Optional molecule name.
         #[arg(long)]
         name: Option<String>,
+        /// Target Product Profile preset for TPP MPO scoring.
+        #[arg(long, value_enum, default_value = "oral")]
+        tpp: CliTpp,
     },
-    /// Print a concise human-readable ADMET & safety profile card for a SMILES string.
+    /// Print a concise human-readable ADMET, TDC QSAR (90% CI + AD), SoM & TPP MPO profile card.
     Profile {
         /// SMILES string (or "SMILES Name").
         smiles: String,
         /// Optional molecule name.
         #[arg(long)]
         name: Option<String>,
+        /// Target Product Profile preset for TPP MPO scoring.
+        #[arg(long, value_enum, default_value = "oral")]
+        tpp: CliTpp,
     },
     /// Compare two molecules side-by-side (MMP / lead optimization delta JSON).
     Compare {
@@ -51,6 +82,9 @@ enum Commands {
         /// Optional name for molecule B.
         #[arg(long)]
         name_b: Option<String>,
+        /// Target Product Profile preset for TPP MPO scoring.
+        #[arg(long, value_enum, default_value = "oral")]
+        tpp: CliTpp,
     },
     /// Process a batch file (.smi, .csv, .sdf) in parallel across all CPU cores.
     Batch {
@@ -62,6 +96,9 @@ enum Commands {
         /// Output format.
         #[arg(long, value_enum, default_value = "csv")]
         format: CliFormat,
+        /// Target Product Profile preset for TPP MPO scoring.
+        #[arg(long, value_enum, default_value = "oral")]
+        tpp: CliTpp,
         /// Optional read sandbox root.
         #[arg(long)]
         read_root: Option<PathBuf>,
@@ -71,6 +108,30 @@ enum Commands {
         /// Explicitly allow creating a non-existent --write-root directory hierarchy.
         #[arg(long)]
         create_write_root: bool,
+    },
+    /// Train the local pure-Rust TDC QSAR GBDT ensemble (Bemis-Murcko scaffold split 70/10/20 + 90% conformal calibration).
+    TrainQsar {
+        /// Directory containing downloaded TDC `.tab` files (defaults to CRAFT_DATA_DIR/models/tdc_raw).
+        #[arg(long)]
+        tdc_dir: Option<PathBuf>,
+        /// Output model pack path (defaults to CRAFT_DATA_DIR/models/admetcraft_v1/admetcraft_tdc_v1.json).
+        #[arg(long)]
+        out_pack: Option<PathBuf>,
+        /// Optional Markdown validation report path.
+        #[arg(long)]
+        out_report: Option<PathBuf>,
+        /// Maximum boosting trees per endpoint.
+        #[arg(long, default_value_t = 240)]
+        max_trees: usize,
+        /// Maximum tree depth.
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+    },
+    /// Display held-out Bemis-Murcko scaffold validation metrics for the installed local QSAR model pack.
+    ModelInfo {
+        /// Optional explicit model pack path (defaults to CRAFT_DATA_DIR/models/admetcraft_v1/admetcraft_tdc_v1.json).
+        #[arg(long)]
+        model_pack: Option<PathBuf>,
     },
     /// Start the Model Context Protocol (MCP) server on stdio or TCP.
     Mcp {
@@ -127,15 +188,15 @@ fn split_smiles_and_name<'a>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Eval { smiles, name } => {
+        Commands::Eval { smiles, name, tpp } => {
             let (smi_token, final_name) = split_smiles_and_name(&smiles, name.as_deref());
-            let eval = evaluate_smiles(smi_token, final_name)?;
+            let eval = evaluate_smiles_auto(smi_token, final_name, tpp.into())?;
             let out = serde_json::to_string_pretty(&eval)?;
             println!("{out}");
         }
-        Commands::Profile { smiles, name } => {
+        Commands::Profile { smiles, name, tpp } => {
             let (smi_token, final_name) = split_smiles_and_name(&smiles, name.as_deref());
-            let eval = evaluate_smiles(smi_token, final_name)?;
+            let eval = evaluate_smiles_auto(smi_token, final_name, tpp.into())?;
             print_profile(&eval);
         }
         Commands::Compare {
@@ -143,10 +204,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             smiles_b,
             name_a,
             name_b,
+            tpp,
         } => {
             let (smi_a, final_a) = split_smiles_and_name(&smiles_a, name_a.as_deref());
             let (smi_b, final_b) = split_smiles_and_name(&smiles_b, name_b.as_deref());
-            let cmp = compare_smiles(smi_a, final_a, smi_b, final_b)?;
+            let cmp = compare_smiles_auto(smi_a, final_a, smi_b, final_b, tpp.into())?;
             let out = serde_json::to_string_pretty(&cmp)?;
             println!("{out}");
         }
@@ -154,6 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             input,
             out,
             format,
+            tpp,
             read_root,
             write_root,
             create_write_root,
@@ -180,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .to_ascii_lowercase();
                 (ext, std::fs::read_to_string(&input)?)
             };
-            let evals = load_molecules_from_text(&ext, &content)?;
+            let evals = load_molecules_from_text(&ext, &content, tpp.into())?;
             if let Some(wr) = write_root.as_deref() {
                 let sb = PathSandbox::new_with_options(None, Some(wr), create_write_root)?;
                 let (resolved_out, mut file) = sb.open_write(&out)?;
@@ -193,6 +256,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 write_report_file(&evals, &out, format.into())?;
                 eprintln!("Exported {} molecule(s) to {}", evals.len(), out.display());
+            }
+        }
+        Commands::TrainQsar {
+            tdc_dir,
+            out_pack,
+            out_report,
+            max_trees,
+            max_depth,
+        } => {
+            let src = tdc_dir.unwrap_or_else(tdc_raw_dir);
+            let dst = out_pack.unwrap_or_else(default_model_pack_path);
+            let cfg = GbdtTrainConfig {
+                max_trees: max_trees.clamp(20, 600),
+                max_depth: max_depth.clamp(2, 7),
+                ..Default::default()
+            };
+            let pack = train_tdc_model_pack(&src, &dst, out_report.as_deref(), &cfg)?;
+            println!("{}", pack.render_validation_markdown());
+            eprintln!(
+                "Saved {} trained QSAR endpoint(s) -> {}",
+                pack.models.len(),
+                dst.display()
+            );
+        }
+        Commands::ModelInfo { model_pack } => {
+            if let Some(path) = model_pack {
+                let pack = AdmetModelPack::load_from_path(&path)?;
+                println!("{}", pack.render_validation_markdown());
+            } else if let Some(pack) = load_default_model_pack() {
+                println!("{}", pack.render_validation_markdown());
+            } else {
+                eprintln!(
+                    "No local TDC QSAR model pack found at {}. Run `admetcraft-cli train-qsar` first.",
+                    default_model_pack_path().display()
+                );
             }
         }
         Commands::Mcp {
@@ -340,6 +438,70 @@ fn print_profile(e: &MoleculeEvaluation) {
         s.dili_alerts.len(),
         fmt_alerts(&s.dili_alerts)
     );
+    if let Some(tpp) = &e.tpp_mpo {
+        println!(
+            "TPP MPO       : {:.3} ({}) [{}]",
+            tpp.score,
+            tpp.decision,
+            tpp.preset.as_str()
+        );
+        for hs in &tpp.hard_stops {
+            println!("  HARD STOP   : {hs}");
+        }
+    }
+    if let Some(qsar) = &e.qsar {
+        println!(
+            "QSAR Panel    : {} endpoints (v{}) | AD={} (maxSim={:.3}, top5={:.3}, Z={:.2})",
+            qsar.endpoints.len(),
+            qsar.model_pack_version,
+            qsar.overall_ad.status.as_str(),
+            qsar.overall_ad.max_tanimoto,
+            qsar.overall_ad.top5_tanimoto,
+            qsar.overall_ad.descriptor_z_rms
+        );
+        for ep in &qsar.endpoints {
+            match ep.task {
+                QsarTaskKind::BinaryClassification => {
+                    println!(
+                        "  {:25} P={:.3} [{:.2}..{:.2}] | {:19} | AD={:13} ({}={:.3})",
+                        ep.endpoint_id,
+                        ep.value,
+                        ep.ci90_low,
+                        ep.ci90_high,
+                        ep.conformal_call,
+                        ep.applicability_domain.status.as_str(),
+                        ep.test_metric_name,
+                        ep.test_metric_value
+                    );
+                }
+                QsarTaskKind::Regression => {
+                    println!(
+                        "  {:25} {:34} | AD={:13} ({}={:.3})",
+                        ep.endpoint_id,
+                        ep.conformal_call,
+                        ep.applicability_domain.status.as_str(),
+                        ep.test_metric_name,
+                        ep.test_metric_value
+                    );
+                }
+            }
+        }
+    }
+    if !e.metabolism_sites.is_empty() {
+        println!("Sites of Met. : {} hotspot(s)", e.metabolism_sites.len());
+        for s_m in e.metabolism_sites.iter().take(5) {
+            println!(
+                "  #{:<2} {:2} {:18} | {:36} | {:.2} ({}) -> {}",
+                s_m.atom_index + 1,
+                s_m.atom_symbol,
+                s_m.isoform,
+                s_m.reaction,
+                s_m.lability_score,
+                s_m.risk.as_str(),
+                s_m.medchem_fix
+            );
+        }
+    }
     for w_msg in &e.warnings {
         println!("Warning       : {w_msg}");
     }
@@ -348,6 +510,7 @@ fn print_profile(e: &MoleculeEvaluation) {
 fn load_molecules_from_text(
     ext: &str,
     content: &str,
+    tpp: TppPreset,
 ) -> Result<Vec<admet_calc::MoleculeEvaluation>, Box<dyn std::error::Error>> {
     let mut mols = Vec::new();
     if ext == "sdf" || ext == "mol" {
@@ -372,7 +535,7 @@ fn load_molecules_from_text(
             }
         }
     }
-    Ok(evaluate_batch(&mols))
+    Ok(evaluate_batch_auto(&mols, tpp))
 }
 
 #[cfg(test)]
@@ -483,7 +646,7 @@ mod tests {
         let tools = lines[4]["result"]["tools"]
             .as_array()
             .ok_or("tools must be array")?;
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         for t in tools {
             assert!(
                 t.get("outputSchema").is_some(),

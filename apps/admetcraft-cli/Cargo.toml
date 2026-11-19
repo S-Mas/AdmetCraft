@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 chem-core = { path = "../../crates/chem-core" }
 admet-calc = { path = "../../crates/admet-calc" }
+admet-qsar = { path = "../../crates/admet-qsar" }
 admet-report = { path = "../../crates/admet-report" }
 admet-engine = { path = "../../crates/admet-engine" }
 clap.workspace = true

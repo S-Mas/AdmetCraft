@@ -118,7 +118,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admet-calc"
-version = "0.3.1"
+version = "1.0.0"
 dependencies = [
  "chem-core",
  "rayon",
@@ -129,9 +129,10 @@ dependencies = [
 
 [[package]]
 name = "admet-engine"
-version = "0.3.1"
+version = "1.0.0"
 dependencies = [
  "admet-calc",
+ "admet-qsar",
  "admet-report",
  "chem-core",
  "libc",
@@ -142,8 +143,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "admet-qsar"
+version = "1.0.0"
+dependencies = [
+ "admet-calc",
+ "chem-core",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "admet-report"
-version = "0.3.1"
+version = "1.0.0"
 dependencies = [
  "admet-calc",
  "chem-core",
@@ -156,10 +169,11 @@ dependencies = [
 
 [[package]]
 name = "admetcraft"
-version = "0.3.1"
+version = "1.0.0"
 dependencies = [
  "admet-calc",
  "admet-engine",
+ "admet-qsar",
  "admet-report",
  "chem-core",
  "eframe",
@@ -168,10 +182,11 @@ dependencies = [
 
 [[package]]
 name = "admetcraft-cli"
-version = "0.3.1"
+version = "1.0.0"
 dependencies = [
  "admet-calc",
  "admet-engine",
+ "admet-qsar",
  "admet-report",
  "chem-core",
  "clap",
@@ -718,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "chem-core"
-version = "0.3.1"
+version = "1.0.0"
 dependencies = [
  "csv",
  "serde",

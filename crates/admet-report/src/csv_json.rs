@@ -79,6 +79,31 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         "AMES Alerts (heur.)",
         "DILI Alerts (heur.)",
         "Warnings",
+        "AD Status",
+        "AD Max Tanimoto",
+        "TPP Preset",
+        "TPP MPO Score",
+        "TPP Decision",
+        "QSAR hERG P",
+        "QSAR AMES P",
+        "QSAR DILI P",
+        "QSAR ClinTox P",
+        "QSAR CYP1A2 P",
+        "QSAR CYP2C9 P",
+        "QSAR CYP2C19 P",
+        "QSAR CYP2D6 P",
+        "QSAR CYP3A4 P",
+        "QSAR P-gp P",
+        "QSAR HIA P",
+        "QSAR BBB P",
+        "QSAR Caco2 (log cm/s)",
+        "QSAR PPBR (%)",
+        "QSAR VDss (L/kg)",
+        "QSAR CLint (uL/min/mg)",
+        "QSAR Half-Life (h)",
+        "QSAR AqSolDB LogS",
+        "QSAR LogD7.4 (AZ)",
+        "Top Site of Metabolism",
     ])?;
 
     for e in evals {
@@ -95,6 +120,48 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         let ames_str = sf.ames_alerts.join("; ");
         let dili_str = sf.dili_alerts.join("; ");
         let warn_str = e.warnings.join("; ");
+        let qval = |id: &str| -> String {
+            e.qsar
+                .as_ref()
+                .and_then(|q| q.endpoints.iter().find(|ep| ep.endpoint_id == id))
+                .map_or_else(String::new, |ep| format!("{:.3}", ep.value))
+        };
+        let qlin = |id: &str| -> String {
+            e.qsar
+                .as_ref()
+                .and_then(|q| q.endpoints.iter().find(|ep| ep.endpoint_id == id))
+                .and_then(|ep| ep.linear_value)
+                .map_or_else(String::new, |v| format!("{v:.2}"))
+        };
+        let ad_status = e
+            .qsar
+            .as_ref()
+            .map_or_else(String::new, |q| q.overall_ad.status.as_str().to_string());
+        let ad_sim = e
+            .qsar
+            .as_ref()
+            .map_or_else(String::new, |q| format!("{:.3}", q.overall_ad.max_tanimoto));
+        let tpp_preset = e
+            .tpp_mpo
+            .as_ref()
+            .map_or_else(String::new, |t| t.preset.as_str().to_string());
+        let tpp_score = e
+            .tpp_mpo
+            .as_ref()
+            .map_or_else(String::new, |t| format!("{:.3}", t.score));
+        let tpp_dec = e
+            .tpp_mpo
+            .as_ref()
+            .map_or_else(String::new, |t| t.decision.clone());
+        let top_som = e.metabolism_sites.first().map_or_else(String::new, |s| {
+            format!(
+                "{}{} {} ({:.2})",
+                s.atom_symbol,
+                s.atom_index + 1,
+                s.reaction,
+                s.lability_score
+            )
+        });
         wtr.write_record(&[
             sanitize_csv_cell(&e.name),
             e.canonical_smiles.clone(),
@@ -167,6 +234,31 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
             sanitize_csv_cell(&ames_str),
             sanitize_csv_cell(&dili_str),
             sanitize_csv_cell(&warn_str),
+            ad_status,
+            ad_sim,
+            tpp_preset,
+            tpp_score,
+            tpp_dec,
+            qval("herg_karim"),
+            qval("ames"),
+            qval("dili"),
+            qval("clintox"),
+            qval("cyp1a2_veith"),
+            qval("cyp2c9_veith"),
+            qval("cyp2c19_veith"),
+            qval("cyp2d6_veith"),
+            qval("cyp3a4_veith"),
+            qval("pgp_broccatelli"),
+            qval("hia_hou"),
+            qval("bbb_martins"),
+            qval("caco2_wang"),
+            qval("ppbr_az"),
+            qlin("vdss_lombardo"),
+            qlin("clearance_microsome_az"),
+            qlin("half_life_obach"),
+            qval("solubility_aqsoldb"),
+            qval("lipophilicity_astrazeneca"),
+            sanitize_csv_cell(&top_som),
         ])?;
     }
 

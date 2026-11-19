@@ -343,6 +343,191 @@ impl BioavailabilityRadar {
     }
 }
 
+/// Applicability Domain status based on ECFP4 Tanimoto similarity to the training set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ApplicabilityDomainStatus {
+    #[default]
+    InDomain,
+    Borderline,
+    OutOfDomain,
+}
+
+impl ApplicabilityDomainStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InDomain => "In-Domain",
+            Self::Borderline => "Borderline",
+            Self::OutOfDomain => "Out-of-Domain",
+        }
+    }
+}
+
+/// Quantitative Applicability Domain metrics against the endpoint training distribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ApplicabilityDomain {
+    pub status: ApplicabilityDomainStatus,
+    /// Nearest-neighbor ECFP4 Tanimoto similarity to the training set `[0.0, 1.0]`.
+    pub max_tanimoto: f64,
+    /// Mean Tanimoto similarity to the top-5 nearest training neighbors `[0.0, 1.0]`.
+    pub top5_tanimoto: f64,
+    /// Standardized physicochemical leverage (RMS Z-score across core descriptors).
+    pub descriptor_z_rms: f64,
+}
+
+/// Kind of QSAR endpoint prediction (binary classification probability or continuous regression).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QsarTaskKind {
+    BinaryClassification,
+    Regression,
+}
+
+/// Single quantitative TDC QSAR endpoint prediction with 90% Split Conformal uncertainty and AD.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QsarEndpointPrediction {
+    pub endpoint_id: String,
+    pub display_name: String,
+    pub category: String,
+    pub task: QsarTaskKind,
+    /// Predicted probability `[0, 1]` for classification, or point value for regression.
+    pub value: f64,
+    /// Lower bound of the 90% split-conformal interval (for regression) or probability lower band.
+    pub ci90_low: f64,
+    /// Upper bound of the 90% split-conformal interval (for regression) or probability upper band.
+    pub ci90_high: f64,
+    /// Units string (e.g. `"prob"`, `"log(cm/s)"`, `"%"`, `"L/kg"`, `"uL/min/mg"`, `"h"`, `"log(mol/L)"`).
+    pub units: String,
+    /// Optional back-transformed linear-scale value + 90% CI for log10-modeled DMPK endpoints
+    /// (`VDss` in L/kg, `CLint` in uL/min/mg, `Half-Life` in h).
+    #[serde(default)]
+    pub linear_value: Option<f64>,
+    #[serde(default)]
+    pub linear_ci90: Option<[f64; 2]>,
+    /// Human-readable conformal call (`"Positive"`, `"Negative"`, `"Uncertain (Both)"` for classification,
+    /// or range band for regression).
+    pub conformal_call: String,
+    /// Local applicability domain assessment for this endpoint.
+    pub applicability_domain: ApplicabilityDomain,
+    /// Honest held-out Bemis-Murcko scaffold-split test metric (`ROC AUC` for classification,
+    /// `Spearman rho` for regression) measured during local training.
+    pub test_metric_name: String,
+    pub test_metric_value: f64,
+    /// Empirical 90% conformal coverage observed on the held-out scaffold test fold.
+    pub test_conformal_coverage: f64,
+}
+
+/// Complete locally-evaluated TDC QSAR ADMET panel with global Applicability Domain summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct QsarAdmetReport {
+    pub model_pack_version: String,
+    pub model_pack_source: String,
+    pub overall_ad: ApplicabilityDomain,
+    pub endpoints: Vec<QsarEndpointPrediction>,
+}
+
+/// Risk tier for an atomic Site of Metabolism (SoM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MetabolismRisk {
+    #[default]
+    Low,
+    Moderate,
+    High,
+}
+
+impl MetabolismRisk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Moderate => "Moderate",
+            Self::High => "High",
+        }
+    }
+}
+
+/// Predicted atomic Site of Metabolism (CYP3A4 / 2D6 / 2C9 / 1A2 / Phase II UGT & Esterase).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetabolismSite {
+    pub atom_index: usize,
+    pub atom_symbol: String,
+    pub isoform: String,
+    pub reaction: String,
+    /// Normalized metabolic lability score `[0.0, 1.0]`.
+    pub lability_score: f64,
+    pub risk: MetabolismRisk,
+    pub medchem_fix: String,
+}
+
+/// Configurable Target Product Profile (TPP) preset for multiparameter optimization (TPP MPO).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TppPreset {
+    #[default]
+    OralSmallMolecule,
+    CnsPenetrant,
+    PeripheralSelective,
+    OncologyKinase,
+}
+
+impl TppPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OralSmallMolecule => "Oral Small Molecule",
+            Self::CnsPenetrant => "CNS Penetrant",
+            Self::PeripheralSelective => "Peripheral Selective",
+            Self::OncologyKinase => "Oncology / Kinase",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::OralSmallMolecule => "oral",
+            Self::CnsPenetrant => "cns",
+            Self::PeripheralSelective => "peripheral",
+            Self::OncologyKinase => "oncology",
+        }
+    }
+}
+
+/// Traffic-light status for an individual TPP objective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TppStatus {
+    #[default]
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl TppStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+/// Single objective evaluation inside a Target Product Profile (TPP) report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TppCriterionResult {
+    pub name: String,
+    pub observed: String,
+    pub target_spec: String,
+    pub desirability: f64,
+    pub weight: f64,
+    pub status: TppStatus,
+}
+
+/// Multiparameter Target Product Profile (TPP MPO) scorecard & hard safety gates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TppMpoReport {
+    pub preset: TppPreset,
+    /// Overall weighted desirability score in `[0.0, 1.0]`.
+    pub score: f64,
+    /// Overall recommendation (`"Advance"`, `"Optimize"`, `"Hold / Red-Flag"`).
+    pub decision: String,
+    pub hard_stops: Vec<String>,
+    pub criteria: Vec<TppCriterionResult>,
+}
+
 /// Complete ADMET evaluation for one molecule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeEvaluation {
@@ -363,6 +548,15 @@ pub struct MoleculeEvaluation {
     pub safety: SafetyProfile,
     pub boiled_egg: BoiledEggPoint,
     pub bioavailability_radar: BioavailabilityRadar,
+    /// Optional quantitative TDC QSAR panel with 90% Split Conformal intervals & Applicability Domain.
+    #[serde(default)]
+    pub qsar: Option<QsarAdmetReport>,
+    /// Atomic Sites of Metabolism (CYP450 + Phase II UGT / Esterase) sorted by lability.
+    #[serde(default)]
+    pub metabolism_sites: Vec<MetabolismSite>,
+    /// Target Product Profile (TPP) Multiparameter Optimization scorecard.
+    #[serde(default)]
+    pub tpp_mpo: Option<TppMpoReport>,
 }
 
 /// Side-by-side ADMET delta between two molecules (e.g. parent vs analogue / bioisostere).

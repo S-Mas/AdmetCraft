@@ -7,7 +7,8 @@ pub mod sandbox;
 
 use std::path::{Path, PathBuf};
 
-use admet_calc::{MoleculeEvaluation, evaluate_batch};
+use admet_calc::{MoleculeEvaluation, TppPreset};
+use admet_qsar::{compute_tpp_mpo, evaluate_batch_auto};
 use admet_report::{ExportFormat, ReportError, write_report_file, write_report_to_writer};
 use chem_core::{ChemError, Molecule, parse_csv_batch, parse_sdf, parse_smiles_batch};
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,7 @@ pub struct AdmetSession {
     pub evaluations: Vec<MoleculeEvaluation>,
     pub failures: Vec<ParseFailure>,
     pub selected_index: Option<usize>,
+    pub tpp_preset: TppPreset,
     undo_stack: Vec<SessionSnapshot>,
     redo_stack: Vec<SessionSnapshot>,
 }
@@ -74,8 +76,17 @@ impl AdmetSession {
             evaluations: Vec::new(),
             failures: Vec::new(),
             selected_index: None,
+            tpp_preset: TppPreset::OralSmallMolecule,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+        }
+    }
+
+    /// Update active Target Product Profile preset and recompute TPP MPO on all loaded molecules.
+    pub fn set_tpp_preset(&mut self, preset: TppPreset) {
+        self.tpp_preset = preset;
+        for ev in &mut self.evaluations {
+            ev.tpp_mpo = Some(compute_tpp_mpo(ev, preset));
         }
     }
 
@@ -301,7 +312,7 @@ impl CommandRegistry {
                         }),
                     }
                 }
-                let evals = evaluate_batch(&mols);
+                let evals = evaluate_batch_auto(&mols, session.tpp_preset);
                 session.evaluations = evals;
                 session.failures = failures;
                 session.selected_index = if session.evaluations.is_empty() {
@@ -338,7 +349,7 @@ impl CommandRegistry {
                         }),
                     }
                 }
-                let evals = evaluate_batch(&mols);
+                let evals = evaluate_batch_auto(&mols, session.tpp_preset);
                 session.smiles_input = evals
                     .iter()
                     .map(|e| format!("{} {}", e.canonical_smiles, e.name))
@@ -372,7 +383,7 @@ impl CommandRegistry {
                         }),
                     }
                 }
-                let evals = evaluate_batch(&mols);
+                let evals = evaluate_batch_auto(&mols, session.tpp_preset);
                 session.smiles_input = evals
                     .iter()
                     .map(|e| format!("{} {}", e.canonical_smiles, e.name))

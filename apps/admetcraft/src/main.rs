@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use admet_calc::MoleculeEvaluation;
+use admet_calc::{
+    ApplicabilityDomainStatus, MetabolismRisk, MoleculeEvaluation, QsarTaskKind, TppPreset,
+    TppStatus,
+};
 use admet_engine::{
     AdmetSession, Command, CommandRegistry, FilterCriteria, MAX_READ_BYTES, PathSandbox,
 };
@@ -19,11 +22,12 @@ use eframe::egui;
 use egui::{Color32, RichText, Sense, Vec2};
 
 use charts::{draw_bioavailability_radar, draw_boiled_egg_interactive};
-use sketcher::{MoleculeSketcher, draw_cached_molecule_2d};
+use sketcher::{MoleculeSketcher, draw_cached_molecule_2d, draw_cached_molecule_2d_with_som};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainTab {
     Cards,
+    Qsar,
     BoiledEgg,
     Table,
 }
@@ -35,6 +39,7 @@ struct AdmetCraftApp {
     active_tab: MainTab,
     dark_mode: bool,
     show_egg_names: bool,
+    show_som_overlay: bool,
     palette_open: bool,
     palette_query: String,
     import_path: String,
@@ -82,6 +87,7 @@ impl AdmetCraftApp {
             active_tab: MainTab::Cards,
             dark_mode: false,
             show_egg_names: true,
+            show_som_overlay: true,
             palette_open: false,
             palette_query: String::new(),
             import_path: String::new(),
@@ -593,6 +599,11 @@ impl eframe::App for AdmetCraftApp {
                     ui.selectable_value(&mut self.active_tab, MainTab::Cards, "Molecule Cards");
                     ui.selectable_value(
                         &mut self.active_tab,
+                        MainTab::Qsar,
+                        "QSAR (TDC + 90% CI + SoM + TPP)",
+                    );
+                    ui.selectable_value(
+                        &mut self.active_tab,
                         MainTab::BoiledEgg,
                         "BOILED-Egg Plot",
                     );
@@ -602,6 +613,7 @@ impl eframe::App for AdmetCraftApp {
                         "Batch Summary Table",
                     );
                     ui.separator();
+                    ui.checkbox(&mut self.show_som_overlay, "2D Sites of Metabolism Overlay");
                     ui.checkbox(&mut self.dark_mode, "Dark Theme");
                 });
 
@@ -674,6 +686,38 @@ impl eframe::App for AdmetCraftApp {
                         ui.close_menu();
                     }
                 });
+                ui.separator();
+                ui.label("TPP:");
+                let prev_tpp = self.session.tpp_preset;
+                let mut cur_tpp = prev_tpp;
+                egui::ComboBox::from_id_salt("tpp_preset_combo")
+                    .selected_text(cur_tpp.as_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut cur_tpp,
+                            TppPreset::OralSmallMolecule,
+                            TppPreset::OralSmallMolecule.as_str(),
+                        );
+                        ui.selectable_value(
+                            &mut cur_tpp,
+                            TppPreset::CnsPenetrant,
+                            TppPreset::CnsPenetrant.as_str(),
+                        );
+                        ui.selectable_value(
+                            &mut cur_tpp,
+                            TppPreset::PeripheralSelective,
+                            TppPreset::PeripheralSelective.as_str(),
+                        );
+                        ui.selectable_value(
+                            &mut cur_tpp,
+                            TppPreset::OncologyKinase,
+                            TppPreset::OncologyKinase.as_str(),
+                        );
+                    });
+                if cur_tpp != prev_tpp {
+                    self.session.set_tpp_preset(cur_tpp);
+                    self.status_msg = format!("TPP preset -> {}", cur_tpp.as_str());
+                }
             });
         });
 
@@ -779,6 +823,11 @@ impl eframe::App for AdmetCraftApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.active_tab, MainTab::Cards, "Molecule Cards");
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    MainTab::Qsar,
+                    "QSAR (TDC + 90% CI + SoM + TPP)",
+                );
                 ui.selectable_value(&mut self.active_tab, MainTab::BoiledEgg, "BOILED-Egg Plot");
                 ui.selectable_value(&mut self.active_tab, MainTab::Table, "Batch Summary Table");
                 ui.separator();
@@ -842,6 +891,7 @@ impl eframe::App for AdmetCraftApp {
 
             match self.active_tab {
                 MainTab::Cards => self.render_cards_tab(ui),
+                MainTab::Qsar => self.render_qsar_tab(ui),
                 MainTab::BoiledEgg => {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.show_egg_names, "Show Molecule Names");
@@ -919,7 +969,10 @@ impl AdmetCraftApp {
 
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.strong("2D Structure");
+                        ui.horizontal(|ui| {
+                            ui.strong("2D Structure");
+                            ui.checkbox(&mut self.show_som_overlay, "SoM Hotspots");
+                        });
                         let (rect, _) =
                             ui.allocate_exact_size(Vec2::new(260.0, 220.0), Sense::hover());
                         let bg = if self.dark_mode {
@@ -929,12 +982,22 @@ impl AdmetCraftApp {
                         };
                         ui.painter_at(rect).rect_filled(rect, 4.0, bg);
                         if let Some(mol) = self.mol_cache.get(&eval.canonical_smiles) {
-                            draw_cached_molecule_2d(
-                                &ui.painter_at(rect),
-                                mol,
-                                rect,
-                                self.dark_mode,
-                            );
+                            if self.show_som_overlay && !eval.metabolism_sites.is_empty() {
+                                draw_cached_molecule_2d_with_som(
+                                    &ui.painter_at(rect),
+                                    mol,
+                                    rect,
+                                    self.dark_mode,
+                                    &eval.metabolism_sites,
+                                );
+                            } else {
+                                draw_cached_molecule_2d(
+                                    &ui.painter_at(rect),
+                                    mol,
+                                    rect,
+                                    self.dark_mode,
+                                );
+                            }
                         }
                     });
                     ui.add_space(16.0);
@@ -995,10 +1058,299 @@ impl AdmetCraftApp {
                         eval.safety.ames_alerts.len(),
                         eval.safety.dili_alerts.len()
                     ));
+                    if let Some(tpp) = &eval.tpp_mpo {
+                        ui.separator();
+                        let tc = if tpp.decision == "Advance" {
+                            Color32::from_rgb(35, 145, 70)
+                        } else if tpp.decision == "Optimize" {
+                            Color32::from_rgb(185, 125, 20)
+                        } else {
+                            Color32::from_rgb(195, 50, 50)
+                        };
+                        ui.colored_label(
+                            tc,
+                            RichText::new(format!("TPP MPO: {:.2} ({})", tpp.score, tpp.decision))
+                                .strong(),
+                        );
+                    }
+                    if let Some(qsar) = &eval.qsar {
+                        ui.separator();
+                        let adc = match qsar.overall_ad.status {
+                            ApplicabilityDomainStatus::InDomain => Color32::from_rgb(35, 145, 70),
+                            ApplicabilityDomainStatus::Borderline => {
+                                Color32::from_rgb(185, 125, 20)
+                            }
+                            ApplicabilityDomainStatus::OutOfDomain => {
+                                Color32::from_rgb(195, 50, 50)
+                            }
+                        };
+                        ui.colored_label(
+                            adc,
+                            RichText::new(format!(
+                                "AD: {} (T={:.2})",
+                                qsar.overall_ad.status.as_str(),
+                                qsar.overall_ad.max_tanimoto
+                            ))
+                            .strong(),
+                        );
+                    }
                 });
 
                 ui.add_space(8.0);
                 render_admet_sections(ui, &eval);
+            });
+    }
+
+    fn render_qsar_tab(&mut self, ui: &mut egui::Ui) {
+        let mut next_selected: Option<usize> = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("qsar_mol_chips")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (idx, ev) in self.session.evaluations.iter().enumerate() {
+                        let is_sel = self.session.selected_index == Some(idx);
+                        if ui.selectable_label(is_sel, &ev.name).clicked() {
+                            next_selected = Some(idx);
+                        }
+                    }
+                });
+            });
+        if let Some(idx) = next_selected {
+            self.session.selected_index = Some(idx);
+            if let Some(ev) = self.session.evaluations.get(idx) {
+                let _ = self.sketcher.load_smiles(&ev.canonical_smiles);
+            }
+        }
+        ui.separator();
+
+        let sel_idx = self.session.selected_index.unwrap_or(0);
+        let Some(eval) = self.session.evaluations.get(sel_idx).cloned() else {
+            return;
+        };
+
+        egui::ScrollArea::vertical()
+            .id_salt("qsar_body")
+            .show(ui, |ui| {
+                // 1. TPP MPO Scorecard
+                if let Some(tpp) = &eval.tpp_mpo {
+                    let dec_col = if tpp.decision == "Advance" {
+                        Color32::from_rgb(35, 145, 70)
+                    } else if tpp.decision == "Optimize" {
+                        Color32::from_rgb(185, 125, 20)
+                    } else {
+                        Color32::from_rgb(195, 50, 50)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.heading(format!("{} — TPP MPO", eval.name));
+                        ui.colored_label(
+                            dec_col,
+                            RichText::new(format!("{:.3} ({})", tpp.score, tpp.decision))
+                                .size(17.0)
+                                .strong(),
+                        );
+                        ui.weak(format!("[{}]", tpp.preset.as_str()));
+                    });
+                    for hs in &tpp.hard_stops {
+                        ui.colored_label(
+                            Color32::from_rgb(200, 40, 40),
+                            RichText::new(format!("HARD STOP: {hs}")).strong(),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    egui::Grid::new("tpp_grid")
+                        .striped(true)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for h in ["Objective", "Observed", "Target Spec", "Desirability", "Status"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for c in &tpp.criteria {
+                                ui.label(&c.name);
+                                ui.monospace(&c.observed);
+                                ui.weak(&c.target_spec);
+                                ui.label(format!("{:.2}", c.desirability));
+                                let sc = match c.status {
+                                    TppStatus::Pass => Color32::from_rgb(35, 145, 70),
+                                    TppStatus::Warn => Color32::from_rgb(185, 125, 20),
+                                    TppStatus::Fail => Color32::from_rgb(195, 50, 50),
+                                };
+                                ui.colored_label(sc, RichText::new(c.status.as_str()).strong());
+                                ui.end_row();
+                            }
+                        });
+                    ui.separator();
+                }
+
+                // 2. Quantitative TDC QSAR Panel (20 endpoints + 90% Conformal CI + AD)
+                if let Some(qsar) = &eval.qsar {
+                    let adc = match qsar.overall_ad.status {
+                        ApplicabilityDomainStatus::InDomain => Color32::from_rgb(35, 145, 70),
+                        ApplicabilityDomainStatus::Borderline => Color32::from_rgb(185, 125, 20),
+                        ApplicabilityDomainStatus::OutOfDomain => Color32::from_rgb(195, 50, 50),
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(format!(
+                            "Quantitative TDC QSAR Panel ({} endpoints, v{})",
+                            qsar.endpoints.len(),
+                            qsar.model_pack_version
+                        ));
+                        ui.separator();
+                        ui.colored_label(
+                            adc,
+                            RichText::new(format!(
+                                "Global AD: {} (maxSim={:.3}, top5={:.3}, Z={:.2})",
+                                qsar.overall_ad.status.as_str(),
+                                qsar.overall_ad.max_tanimoto,
+                                qsar.overall_ad.top5_tanimoto,
+                                qsar.overall_ad.descriptor_z_rms
+                            ))
+                            .strong(),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    egui::Grid::new("qsar_endpoints_grid")
+                        .striped(true)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for h in [
+                                "Endpoint",
+                                "Category",
+                                "Prediction (90% Conformal CI)",
+                                "Conformal Call",
+                                "AD Status",
+                                "Scaffold Val.",
+                            ] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for ep in &qsar.endpoints {
+                                ui.label(&ep.display_name);
+                                ui.weak(&ep.category);
+                                match ep.task {
+                                    QsarTaskKind::BinaryClassification => {
+                                        let col = if ep.category == "Toxicity"
+                                            || ep.category == "Metabolism"
+                                        {
+                                            if ep.value >= 0.65 {
+                                                Color32::from_rgb(195, 50, 50)
+                                            } else if ep.value >= 0.40 {
+                                                Color32::from_rgb(185, 125, 20)
+                                            } else {
+                                                Color32::from_rgb(35, 145, 70)
+                                            }
+                                        } else {
+                                            ui.visuals().text_color()
+                                        };
+                                        ui.colored_label(
+                                            col,
+                                            RichText::new(format!(
+                                                "P = {:.3} [{:.2}..{:.2}]",
+                                                ep.value, ep.ci90_low, ep.ci90_high
+                                            ))
+                                            .monospace(),
+                                        );
+                                    }
+                                    QsarTaskKind::Regression => {
+                                        ui.monospace(&ep.conformal_call);
+                                    }
+                                }
+                                ui.label(match ep.task {
+                                    QsarTaskKind::BinaryClassification => ep.conformal_call.as_str(),
+                                    QsarTaskKind::Regression => "90% Split-Conformal",
+                                });
+                                let ep_adc = match ep.applicability_domain.status {
+                                    ApplicabilityDomainStatus::InDomain => {
+                                        Color32::from_rgb(35, 145, 70)
+                                    }
+                                    ApplicabilityDomainStatus::Borderline => {
+                                        Color32::from_rgb(185, 125, 20)
+                                    }
+                                    ApplicabilityDomainStatus::OutOfDomain => {
+                                        Color32::from_rgb(195, 50, 50)
+                                    }
+                                };
+                                ui.colored_label(
+                                    ep_adc,
+                                    format!(
+                                        "{} ({:.2})",
+                                        ep.applicability_domain.status.as_str(),
+                                        ep.applicability_domain.max_tanimoto
+                                    ),
+                                );
+                                ui.weak(format!(
+                                    "{} {:.3} (Cov {:.0}%)",
+                                    ep.test_metric_name,
+                                    ep.test_metric_value,
+                                    ep.test_conformal_coverage * 100.0
+                                ));
+                                ui.end_row();
+                            }
+                        });
+                } else {
+                    ui.colored_label(
+                        Color32::from_rgb(185, 125, 20),
+                        "No local TDC QSAR model pack found. Run `admetcraft-cli train-qsar` to generate it in CRAFT_DATA_DIR/models/admetcraft_v1.",
+                    );
+                }
+
+                ui.separator();
+                // 3. Atomic Sites of Metabolism (SoM) + 2D visual map
+                ui.strong(format!(
+                    "Atomic Sites of Metabolism — CYP450 & Phase II ({} hotspot(s))",
+                    eval.metabolism_sites.len()
+                ));
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(260.0, 210.0), Sense::hover());
+                    let bg = if self.dark_mode {
+                        Color32::from_rgb(30, 32, 36)
+                    } else {
+                        Color32::WHITE
+                    };
+                    ui.painter_at(rect).rect_filled(rect, 4.0, bg);
+                    if let Some(mol) = self.mol_cache.get(&eval.canonical_smiles) {
+                        draw_cached_molecule_2d_with_som(
+                            &ui.painter_at(rect),
+                            mol,
+                            rect,
+                            self.dark_mode,
+                            &eval.metabolism_sites,
+                        );
+                    }
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        if eval.metabolism_sites.is_empty() {
+                            ui.weak("No high-lability metabolic soft spots detected.");
+                        } else {
+                            egui::Grid::new("som_grid")
+                                .striped(true)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    for h in ["Atom", "Isoform", "Reaction", "Score", "MedChem Fix"] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for s in &eval.metabolism_sites {
+                                        ui.monospace(format!("{}{}", s.atom_symbol, s.atom_index + 1));
+                                        ui.label(&s.isoform);
+                                        ui.label(&s.reaction);
+                                        let rc = match s.risk {
+                                            MetabolismRisk::High => Color32::from_rgb(195, 50, 50),
+                                            MetabolismRisk::Moderate => Color32::from_rgb(185, 125, 20),
+                                            MetabolismRisk::Low => Color32::from_rgb(120, 120, 130),
+                                        };
+                                        ui.colored_label(
+                                            rc,
+                                            RichText::new(format!("{:.2} ({})", s.lability_score, s.risk.as_str()))
+                                                .strong(),
+                                        );
+                                        ui.weak(&s.medchem_fix);
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                    });
+                });
             });
     }
 

@@ -78,6 +78,9 @@ pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
         safety,
         boiled_egg,
         bioavailability_radar,
+        qsar: None,
+        metabolism_sites: Vec::new(),
+        tpp_mpo: None,
     }
 }
 

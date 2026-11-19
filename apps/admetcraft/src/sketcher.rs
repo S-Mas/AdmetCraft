@@ -1,5 +1,6 @@
 use std::f64::consts::PI;
 
+use admet_calc::{MetabolismRisk, MetabolismSite};
 use chem_core::{Atom, BondOrder, BondStereo, Molecule, ensure_2d_coords, parse_smiles};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
@@ -505,6 +506,43 @@ pub fn draw_cached_molecule_2d(
     rect: Rect,
     dark_mode: bool,
 ) {
+    draw_molecule_in_rect(painter, mol, rect, dark_mode, None);
+}
+
+/// Render a pre-laid-out `Molecule` with translucent atomic Sites of Metabolism (SoM) halos.
+pub fn draw_cached_molecule_2d_with_som(
+    painter: &egui::Painter,
+    mol: &Molecule,
+    rect: Rect,
+    dark_mode: bool,
+    som_sites: &[MetabolismSite],
+) {
+    let view = CanvasTransform::fit_molecule(mol, rect);
+    for site in som_sites {
+        let Some(c) = mol.atoms.get(site.atom_index).and_then(|a| a.coords_2d) else {
+            continue;
+        };
+        let p = view.to_screen(c);
+        let (fill, stroke, r) = match site.risk {
+            MetabolismRisk::High => (
+                Color32::from_rgba_unmultiplied(220, 45, 45, 78),
+                Color32::from_rgb(205, 40, 40),
+                11.5_f32,
+            ),
+            MetabolismRisk::Moderate => (
+                Color32::from_rgba_unmultiplied(230, 145, 25, 68),
+                Color32::from_rgb(205, 120, 15),
+                9.5_f32,
+            ),
+            MetabolismRisk::Low => (
+                Color32::from_rgba_unmultiplied(180, 180, 50, 45),
+                Color32::from_rgb(160, 150, 40),
+                8.0_f32,
+            ),
+        };
+        painter.circle_filled(p, r, fill);
+        painter.circle_stroke(p, r, Stroke::new(1.2_f32, stroke));
+    }
     draw_molecule_in_rect(painter, mol, rect, dark_mode, None);
 }
 
