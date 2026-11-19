@@ -45,14 +45,32 @@ struct AdmetCraftApp {
 
 impl Default for AdmetCraftApp {
     fn default() -> Self {
+        Self::from_startup_path(None)
+    }
+}
+
+impl AdmetCraftApp {
+    fn from_startup_path(startup_file: Option<PathBuf>) -> Self {
         let mut session = AdmetSession::new();
-        let status_msg = match CommandRegistry::execute(&mut session, Command::LoadExampleBatch) {
-            Ok(out) => out.message,
-            Err(e) => format!("Init warning: {e}"),
+        let status_msg = if startup_file.is_some() {
+            "Loading handoff batch...".to_string()
+        } else {
+            match CommandRegistry::execute(&mut session, Command::LoadExampleBatch) {
+                Ok(out) => out.message,
+                Err(e) => format!("Init warning: {e}"),
+            }
         };
-        let export_dir = std::env::current_dir()
+        let export_dir = startup_file
+            .as_ref()
+            .and_then(|p| p.parent())
+            .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            })
+            .unwrap_or_else(|| ".".to_string());
         let mut sketcher = MoleculeSketcher::default();
         if let Some(first) = session.evaluations.first() {
             let _ = sketcher.load_smiles(&first.canonical_smiles);
@@ -71,12 +89,15 @@ impl Default for AdmetCraftApp {
             status_msg,
             async_status: Arc::new(Mutex::new(None)),
         };
-        app.rebuild_mol_cache();
+        if let Some(path) = startup_file {
+            app.import_path = path.display().to_string();
+            app.import_file_path(&path, true);
+        } else {
+            app.rebuild_mol_cache();
+        }
         app
     }
-}
 
-impl AdmetCraftApp {
     fn rebuild_mol_cache(&mut self) {
         self.mol_cache.clear();
         for ev in &self.session.evaluations {
@@ -493,12 +514,114 @@ impl eframe::App for AdmetCraftApp {
         self.handle_shortcuts(ctx);
         self.render_palette(ctx);
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading(RichText::new("AdmetCraft").strong());
-                ui.label(RichText::new("Local-First ADMET Workbench").weak());
+        egui::TopBottomPanel::top("craft_menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.strong("AdmetCraft");
+                ui.label(
+                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .small()
+                        .weak(),
+                );
                 ui.separator();
 
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open / Import (.smi, .csv, .sdf)...").clicked() {
+                        self.browse_import_file();
+                        ui.close_menu();
+                    }
+                    if ui.button("Load 15 Example Drugs (Ctrl+E)").clicked() {
+                        self.run_command(Command::LoadExampleBatch);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.menu_button("Export Report", |ui| {
+                        if ui.button("CSV Table (admetcraft_report.csv)").clicked() {
+                            self.export(ctx, ExportFormat::Csv, "admetcraft_report.csv");
+                            ui.close_menu();
+                        }
+                        if ui.button("JSON Full (admetcraft_report.json)").clicked() {
+                            self.export(ctx, ExportFormat::Json, "admetcraft_report.json");
+                            ui.close_menu();
+                        }
+                        if ui.button("PDF Report (admetcraft_report.pdf)").clicked() {
+                            self.export(ctx, ExportFormat::Pdf, "admetcraft_report.pdf");
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("BOILED-Egg SVG (admetcraft_boiled_egg.svg)")
+                            .clicked()
+                        {
+                            self.export(
+                                ctx,
+                                ExportFormat::SvgBoiledEgg,
+                                "admetcraft_boiled_egg.svg",
+                            );
+                            ui.close_menu();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Clear Session").clicked() {
+                        self.run_command(Command::ClearSession);
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("Edit", |ui| {
+                    if ui
+                        .add_enabled(self.session.can_undo(), egui::Button::new("Undo (Ctrl+Z)"))
+                        .clicked()
+                    {
+                        self.run_command(Command::Undo);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(self.session.can_redo(), egui::Button::new("Redo (Ctrl+Y)"))
+                        .clicked()
+                    {
+                        self.run_command(Command::Redo);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Run ADMET Batch (Ctrl+Enter)").clicked() {
+                        let input = self.session.smiles_input.clone();
+                        self.run_command(Command::EvaluateBatchText { input });
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("View", |ui| {
+                    ui.selectable_value(&mut self.active_tab, MainTab::Cards, "Molecule Cards");
+                    ui.selectable_value(
+                        &mut self.active_tab,
+                        MainTab::BoiledEgg,
+                        "BOILED-Egg Plot",
+                    );
+                    ui.selectable_value(
+                        &mut self.active_tab,
+                        MainTab::Table,
+                        "Batch Summary Table",
+                    );
+                    ui.separator();
+                    ui.checkbox(&mut self.dark_mode, "Dark Theme");
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Ctrl+K").clicked() {
+                        self.palette_open = true;
+                        self.palette_query.clear();
+                    }
+                    if ui
+                        .small_button(if self.dark_mode { "Light" } else { "Dark" })
+                        .clicked()
+                    {
+                        self.dark_mode = !self.dark_mode;
+                    }
+                });
+            });
+        });
+
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
                 if ui
                     .button(
                         RichText::new("▶ Run!")
@@ -509,6 +632,9 @@ impl eframe::App for AdmetCraftApp {
                 {
                     let input = self.session.smiles_input.clone();
                     self.run_command(Command::EvaluateBatchText { input });
+                }
+                if ui.button("Open").clicked() {
+                    self.browse_import_file();
                 }
                 if ui.button("Examples").clicked() {
                     self.run_command(Command::LoadExampleBatch);
@@ -530,29 +656,24 @@ impl eframe::App for AdmetCraftApp {
                     self.run_command(Command::Redo);
                 }
                 ui.separator();
-                if ui.button("CSV").clicked() {
-                    self.export(ctx, ExportFormat::Csv, "admetcraft_report.csv");
-                }
-                if ui.button("JSON").clicked() {
-                    self.export(ctx, ExportFormat::Json, "admetcraft_report.json");
-                }
-                if ui.button("PDF").clicked() {
-                    self.export(ctx, ExportFormat::Pdf, "admetcraft_report.pdf");
-                }
-                if ui.button("Egg SVG").clicked() {
-                    self.export(ctx, ExportFormat::SvgBoiledEgg, "admetcraft_boiled_egg.svg");
-                }
-                ui.separator();
-                if ui
-                    .button(if self.dark_mode { "Light" } else { "Dark" })
-                    .clicked()
-                {
-                    self.dark_mode = !self.dark_mode;
-                }
-                if ui.button("Palette (Ctrl+K)").clicked() {
-                    self.palette_open = true;
-                    self.palette_query.clear();
-                }
+                ui.menu_button("Export ▾", |ui| {
+                    if ui.button("CSV").clicked() {
+                        self.export(ctx, ExportFormat::Csv, "admetcraft_report.csv");
+                        ui.close_menu();
+                    }
+                    if ui.button("JSON").clicked() {
+                        self.export(ctx, ExportFormat::Json, "admetcraft_report.json");
+                        ui.close_menu();
+                    }
+                    if ui.button("PDF").clicked() {
+                        self.export(ctx, ExportFormat::Pdf, "admetcraft_report.pdf");
+                        ui.close_menu();
+                    }
+                    if ui.button("BOILED-Egg SVG").clicked() {
+                        self.export(ctx, ExportFormat::SvgBoiledEgg, "admetcraft_boiled_egg.svg");
+                        ui.close_menu();
+                    }
+                });
             });
         });
 
@@ -565,6 +686,12 @@ impl eframe::App for AdmetCraftApp {
                     self.status_msg
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("AdmetCraft v{}", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .strong(),
+                    );
+                    ui.separator();
                     ui.add(
                         egui::TextEdit::singleline(&mut self.export_dir)
                             .desired_width(180.0)
@@ -1246,16 +1373,24 @@ fn yes_no(b: bool) -> &'static str {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    let startup_file = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .filter(|p| p.is_file());
+    let title = format!(
+        "AdmetCraft v{} — Local-First ADMET Workbench",
+        env!("CARGO_PKG_VERSION")
+    );
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("AdmetCraft — Local-First ADMET Workbench")
+            .with_title(title)
             .with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
     eframe::run_native(
         "AdmetCraft",
         options,
-        Box::new(|_cc| Ok(Box::new(AdmetCraftApp::default()))),
+        Box::new(move |_cc| Ok(Box::new(AdmetCraftApp::from_startup_path(startup_file)))),
     )
 }
 
