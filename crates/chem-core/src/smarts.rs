@@ -790,9 +790,11 @@ impl<'a> SmartsParser<'a> {
                     return Err(self.err(format!("unexpected primitive '{c0}'")));
                 }
                 let is_arom = c0.is_ascii_lowercase();
+                let next_is_digit = self.bytes.get(self.pos + 2).is_some_and(u8::is_ascii_digit);
                 let end = if self.pos + 1 < self.bytes.len()
                     && (self.bytes[self.pos + 1] as char).is_ascii_lowercase()
-                    && !matches!(self.bytes[self.pos + 1], b'h' | b'r' | b'v')
+                    && !(matches!(self.bytes[self.pos + 1], b'h' | b'r' | b'v')
+                        && (is_arom || next_is_digit))
                 {
                     let two = format!(
                         "{}{}",

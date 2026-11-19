@@ -85,33 +85,10 @@ fn crippen_h_contrib(mol: &Molecule, h_idx: usize) -> (f64, f64) {
 fn crippen_attached_h_contrib(mol: &Molecule, parent_idx: usize) -> (f64, f64) {
     let p = &mol.atoms[parent_idx];
     match p.atomic_number {
-        6 => {
-            if is_carbonyl_or_hetero_multi(mol, parent_idx) || p.hybridization == Hybridization::Sp
-            {
-                (0.2667, 1.313) // H4: attached to sp C or C=X
-            } else {
-                (0.1230, 1.057) // H1: aliphatic or aromatic C-H
-            }
-        }
-        7 => (0.2142, 0.9627), // H3: attached to N
-        8 => {
-            // H2: alcohol/phenol vs carboxylic acid
-            let on_acid = mol.neighbors(parent_idx).any(|c| {
-                mol.atoms[c].atomic_number == 6
-                    && mol.adj[c].iter().any(|&(o2, bid)| {
-                        o2 != parent_idx
-                            && mol.bonds[bid].order == BondOrder::Double
-                            && mol.atoms[o2].atomic_number == 8
-                    })
-            });
-            if on_acid {
-                (0.2980, 0.8939)
-            } else {
-                (-0.2677, 0.8939)
-            }
-        }
-        16 => (0.1125, 1.057), // HS
-        _ => (0.1230, 1.057),
+        6 => (0.1230, 1.0570),       // H1: aliphatic/aromatic/sp C-H
+        7 => (0.2142, 0.9627),       // H3: N-H
+        8 | 16 => (-0.2677, 1.3950), // H2: O-H / S-H (Wildman & Crippen 1999)
+        _ => (0.1230, 1.0570),
     }
 }
 
@@ -123,7 +100,14 @@ fn crippen_heavy_contrib(mol: &Molecule, idx: usize) -> (f64, f64) {
     let mut double_hetero = false;
     let mut triple_any = false;
     let mut arom_bonds = 0usize;
+    let mut arom_nbr_cnt = 0usize;
     for &(nbr, bid) in &mol.adj[idx] {
+        if mol.atoms[nbr].atomic_number == 1 {
+            continue;
+        }
+        if mol.atoms[nbr].aromatic {
+            arom_nbr_cnt += 1;
+        }
         let bo = mol.bonds[bid].order;
         let nz = mol.atoms[nbr].atomic_number;
         match bo {
@@ -141,143 +125,203 @@ fn crippen_heavy_contrib(mol: &Molecule, idx: usize) -> (f64, f64) {
     }
 
     match a.atomic_number {
-        // Carbon types (C1..C27 from Wildman & Crippen 1999)
+        // Carbon types (Wildman & Crippen 1999 C1..C27)
         6 => {
             if a.aromatic {
-                let has_hetero_sub = mol.neighbors(idx).any(|nbr| {
-                    let na = &mol.atoms[nbr];
-                    !matches!(na.atomic_number, 1 | 6)
-                        && mol
-                            .bond_between(idx, nbr)
-                            .is_some_and(|b| b.order != BondOrder::Aromatic)
+                let exo_nbr = mol.adj[idx].iter().copied().find(|&(nbr, bid)| {
+                    mol.atoms[nbr].atomic_number != 1 && mol.bonds[bid].order != BondOrder::Aromatic
                 });
-                let has_arom_hetero_nbr = mol.neighbors(idx).any(|nbr| {
-                    let na = &mol.atoms[nbr];
-                    !matches!(na.atomic_number, 1 | 6)
-                        && mol
-                            .bond_between(idx, nbr)
-                            .is_some_and(|b| b.order == BondOrder::Aromatic)
-                });
-                if double_hetero {
-                    (0.0566, 3.350) // aromatic carbonyl C (e.g. caffeine, coumarin)
-                } else if a.total_h() > 0 {
-                    (0.1581, 3.350) // C18: aromatic CH
-                } else if has_hetero_sub {
-                    (0.1360, 3.743) // C20/C21: aromatic C attached to hetero substituent
-                } else if has_arom_hetero_nbr {
-                    (-0.0044, 3.465) // C19: aromatic C adjacent to aromatic hetero
+                if let Some((ev, bid)) = exo_nbr {
+                    if mol.bonds[bid].order == BondOrder::Double
+                        && matches!(mol.atoms[ev].atomic_number, 8 | 16)
+                    {
+                        // Aromatic carbonyl c(=O) (caffeine, uracil, coumarin, pyridone)
+                        (-0.8186, 4.0000)
+                    } else {
+                        match mol.atoms[ev].atomic_number {
+                            6 => {
+                                if mol.atoms[ev].aromatic {
+                                    (0.2713, 3.9040)
+                                } else {
+                                    (0.1360, 3.5090)
+                                }
+                            }
+                            8 => (0.5437, 3.8530),
+                            7 => (0.4619, 4.0670),
+                            16 => (0.2450, 3.5640),
+                            9 => (0.0000, 3.2570),
+                            17 => (0.2450, 3.5640),
+                            35 => (0.1980, 3.1800),
+                            53 => (0.0000, 3.1040),
+                            _ => (0.1581, 3.3500),
+                        }
+                    }
+                } else if deg >= 3 {
+                    // Fused aromatic junction c(a)(a)a
+                    if hetero_nbrs > 0 {
+                        (0.2955, 3.9040)
+                    } else {
+                        (0.2713, 3.9040)
+                    }
                 } else {
-                    (0.2961, 3.509) // C21: aromatic C-C (substituted / bridgehead)
+                    // Unsubstituted aromatic cH (C18)
+                    (0.1581, 3.3500)
                 }
             } else if triple_any || a.hybridization == Hybridization::Sp {
-                if hetero_nbrs > 0 {
-                    (0.0017, 3.413) // C10: sp C with hetero
-                } else {
-                    (0.3300, 3.875) // C8: sp C
-                }
+                // sp alkyne / nitrile C
+                (0.0017, 3.8880)
             } else if double_hetero {
-                // C=O, C=N, C=S
-                if hetero_nbrs >= 2 {
-                    (-0.0244, 2.753) // ester/acid/amide/urea carbonyl C
-                } else {
-                    (-0.1830, 3.120) // ketone/aldehyde C=O
-                }
+                // Carbonyl / imine / thiocarbonyl sp2 C
+                (-0.2783, 5.0070)
             } else if double_c || a.hybridization == Hybridization::Sp2 {
                 if hetero_nbrs > 0 {
-                    (0.0017, 3.413) // C7/C10: =C-X
-                } else if a.total_h() > 0 {
-                    (0.1551, 3.509) // C5/C6: =CH- / =CH2
+                    (-0.0300, 3.6000)
                 } else {
-                    (0.2640, 3.882) // C6: =C<
+                    (0.1551, 3.5130)
                 }
             } else {
-                // sp3 carbon
-                if hetero_nbrs == 0 {
-                    match deg {
-                        0 | 1 => (0.1441, 2.503), // C1: primary CH3
-                        2 => (0.1441, 2.503),     // C1: secondary CH2
-                        3 => (-0.2051, 2.433),    // C2: tertiary CH
-                        _ => (-0.2051, 2.433),    // C2: quaternary C
-                    }
-                } else {
-                    // sp3 C attached to heteroatom (C3/C4)
-                    let attached_to_f_or_cl = mol
-                        .neighbors(idx)
-                        .any(|n| matches!(mol.atoms[n].atomic_number, 9 | 17 | 35 | 53));
-                    if attached_to_f_or_cl && hetero_nbrs >= 2 {
-                        (0.2050, 2.680) // CX2 / CX3 (e.g. CF3)
-                    } else if deg <= 2 {
-                        (-0.2035, 2.753) // C3: CH3-X, CH2-X
+                // sp3 aliphatic C
+                let hal_cnt = mol
+                    .neighbors(idx)
+                    .filter(|&n| matches!(mol.atoms[n].atomic_number, 9 | 17 | 35 | 53))
+                    .count();
+                if hal_cnt >= 2 {
+                    (-0.0967, 2.5760)
+                } else if arom_nbr_cnt >= 1 {
+                    if deg == 1 {
+                        (0.0845, 2.5030)
                     } else {
-                        (-0.2051, 2.433) // C4: CH-X, C-X
+                        (-0.0516, 2.4880)
                     }
+                } else if hetero_nbrs >= 2 {
+                    (-0.2051, 2.7530)
+                } else if hetero_nbrs == 1 {
+                    let on_arom_het = mol.neighbors(idx).any(|n| {
+                        !matches!(mol.atoms[n].atomic_number, 1 | 6) && mol.atoms[n].aromatic
+                    });
+                    if on_arom_het {
+                        (-0.1444, 2.4120)
+                    } else {
+                        (-0.2035, 2.7530)
+                    }
+                } else if deg >= 3 {
+                    // C2: tertiary CH / quaternary C
+                    (0.0000, 2.4330)
+                } else {
+                    // C1: CH3 / CH2
+                    (0.1441, 2.5030)
                 }
             }
         }
         // Nitrogen types (N1..N14)
         7 => {
-            if a.formal_charge > 0 {
-                if double_hetero {
-                    (-0.3396, 2.800) // nitro N+
+            if a.aromatic {
+                (-0.3239, 2.2020)
+            } else if a.formal_charge > 0 {
+                let o_cnt = mol
+                    .neighbors(idx)
+                    .filter(|&n| mol.atoms[n].atomic_number == 8)
+                    .count();
+                let dbl_n_cnt = mol.adj[idx]
+                    .iter()
+                    .filter(|&&(n, bid)| {
+                        mol.atoms[n].atomic_number == 7 && mol.bonds[bid].order == BondOrder::Double
+                    })
+                    .count();
+                if o_cnt >= 2 {
+                    (-0.3396, 0.2604) // nitro [N+]
+                } else if dbl_n_cnt >= 2 {
+                    (0.2887, 3.3590) // azide =[N+]=
                 } else {
-                    (-0.6600, 2.100) // quaternary N+
+                    (-0.3396, 1.8000)
                 }
-            } else if a.aromatic {
-                (-0.3239, 2.202) // N11/N12: aromatic nitrogen
+            } else if a.formal_charge < 0 {
+                (0.2887, 3.3590) // azide =[N-]
             } else if triple_any {
-                (-0.5666, 2.936) // N9: nitrile #N
+                (0.0151, 1.7250) // nitrile #N
             } else if double_c || double_hetero {
-                if a.total_h() > 0 {
-                    (-0.4806, 2.500) // imine =NH
+                let is_guanidine = mol.neighbors(idx).any(|c| {
+                    mol.atoms[c].atomic_number == 6
+                        && mol
+                            .neighbors(c)
+                            .filter(|&x| mol.atoms[x].atomic_number == 7)
+                            .count()
+                            >= 3
+                });
+                if is_guanidine {
+                    (-0.3239, 2.2020)
                 } else {
-                    (-0.3187, 3.000) // imine =N-
+                    (0.1836, 2.4280) // imine / azo / azide N1
                 }
             } else {
-                // sp3 amine or amide N
-                let is_amide = mol.neighbors(idx).any(|c| {
-                    matches!(mol.atoms[c].atomic_number, 6 | 16)
-                        && mol.adj[c].iter().any(|&(o2, bid)| {
-                            o2 != idx
-                                && mol.bonds[bid].order == BondOrder::Double
-                                && mol.atoms[o2].atomic_number == 8
-                        })
-                });
-                let is_aromatic_adj = mol.neighbors(idx).any(|nbr| mol.atoms[nbr].aromatic);
-                if is_amide {
-                    if a.total_h() >= 1 {
-                        (-0.5060, 2.400) // amide NH
-                    } else {
-                        (-0.4458, 2.830) // tertiary amide N
+                let is_amide = is_amide_n(mol, idx);
+                let is_arom_adj = mol.neighbors(idx).any(|nbr| mol.atoms[nbr].aromatic);
+                if is_arom_adj {
+                    match deg {
+                        0 | 1 => (-1.0270, 2.8270),
+                        2 => (-0.5188, 2.9500),
+                        _ => (-0.4458, 2.8190),
                     }
-                } else if is_aromatic_adj {
-                    (-0.4458, 3.000) // aniline N
+                } else if is_amide {
+                    match deg {
+                        0 | 1 => (-1.0190, 2.2620),
+                        #[allow(clippy::approx_constant)]
+                        2 => (-0.5262, 2.7180),
+                        _ => (-0.3187, 2.8190),
+                    }
                 } else {
                     match deg {
-                        0 | 1 => (-1.0190, 2.262), // N1: R-NH2
-                        2 => (-0.7096, 2.173),     // N2: R2NH
-                        _ => (-0.3187, 2.836),     // N7: R3N
+                        0 | 1 => (-1.0190, 2.2620),
+                        2 => (-0.7096, 2.1730),
+                        _ => (-0.3187, 2.8190),
                     }
                 }
             }
         }
         // Oxygen types (O1..O12)
         8 => {
-            if a.formal_charge < 0 {
-                (-0.7790, 1.380) // O-
-            } else if a.aromatic {
-                (0.1552, 1.080) // O1: furan o
-            } else if double_c || double_hetero {
-                (-0.2476, 0.790) // O9: carbonyl/sulfoxide/sulfone =O
-            } else if a.total_h() > 0 {
-                let on_arom = mol.neighbors(idx).any(|n| mol.atoms[n].aromatic);
-                if on_arom {
-                    (-0.2893, 1.150) // O2: phenolic -OH
+            if a.aromatic {
+                (0.1552, 1.0800)
+            } else if a.formal_charge < 0 {
+                let adj_n_plus = mol
+                    .neighbors(idx)
+                    .any(|n| mol.atoms[n].atomic_number == 7 && mol.atoms[n].formal_charge > 0);
+                if adj_n_plus {
+                    (0.0335, 3.3670) // nitro [O-]
                 } else {
-                    (-0.2893, 1.080) // O2: alcoholic/carboxylic -OH
+                    (-0.3339, 0.7774)
                 }
+            } else if double_c || double_hetero {
+                let adj_n_plus = mol
+                    .neighbors(idx)
+                    .any(|n| mol.atoms[n].atomic_number == 7 && mol.atoms[n].formal_charge > 0);
+                let adj_s = mol.neighbors(idx).any(|n| mol.atoms[n].atomic_number == 16);
+                let adj_p = mol.neighbors(idx).any(|n| mol.atoms[n].atomic_number == 15);
+                let adj_arom_c = mol
+                    .neighbors(idx)
+                    .any(|n| mol.atoms[n].atomic_number == 6 && mol.atoms[n].aromatic);
+                let adj_amide_or_acid = mol.neighbors(idx).any(|n| {
+                    mol.atoms[n].atomic_number == 6
+                        && mol
+                            .neighbors(n)
+                            .any(|u| u != idx && matches!(mol.atoms[u].atomic_number, 7 | 8))
+                });
+                if adj_n_plus {
+                    (0.0335, 3.3670)
+                } else if adj_s {
+                    (-0.3339, 0.7774)
+                } else if adj_p {
+                    (-0.1188, 0.6865)
+                } else if adj_arom_c {
+                    (0.1788, 1.0000)
+                } else if adj_amide_or_acid {
+                    (0.1129, 0.7774)
+                } else {
+                    (-0.1526, 0.0000)
+                }
+            } else if a.total_h() > 0 {
+                (-0.2893, 0.8238) // O2: alcohol / phenol / carboxylic OH / phosphate OH
             } else {
-                // -O- ether / ester
-                let on_arom = mol.neighbors(idx).any(|n| mol.atoms[n].aromatic);
                 let on_carbonyl = mol.neighbors(idx).any(|c| {
                     mol.atoms[c].atomic_number == 6
                         && mol.adj[c].iter().any(|&(o2, bid)| {
@@ -286,34 +330,31 @@ fn crippen_heavy_contrib(mol: &Molecule, idx: usize) -> (f64, f64) {
                                 && mol.atoms[o2].atomic_number == 8
                         })
                 });
-                if on_arom && on_carbonyl {
-                    (-0.0850, 1.180) // aryl ester -O-
-                } else if on_arom {
-                    (-0.1414, 1.180) // O4: Ar-O-R
-                } else if on_carbonyl {
-                    (-0.2000, 1.080) // alkyl ester -O-
+                if on_carbonyl {
+                    (-0.0684, 1.0850) // ester/acid -O-C(=O)
                 } else {
-                    (-0.4195, 1.080) // O3: R-O-R
+                    (-0.4195, 1.1820) // aliphatic or aryl ether -O-
                 }
             }
         }
         // Halogens
-        9 => (0.4202, 1.108),  // F
-        17 => (0.6895, 5.853), // Cl
-        35 => (0.8456, 8.927), // Br
-        53 => (0.8857, 14.02), // I
+        9 => (0.4202, 1.1080),
+        17 => (0.6895, 5.8530),
+        35 => (0.8456, 8.9270),
+        53 => (0.8857, 14.0200),
         // Sulfur
         16 => {
             if arom_bonds >= 2 {
-                (0.6237, 7.591) // aromatic s
-            } else if double_hetero {
-                (-0.0024, 6.920) // S(=O) or S(=O)2
+                (0.6237, 6.6910)
+            } else if double_hetero || deg >= 3 {
+                (-0.0024, 7.3650)
             } else {
-                (0.6482, 7.591) // thioether / thiol
+                (0.6482, 7.5910)
             }
         }
         // Phosphorus
-        15 => (0.8612, 6.920),
+        15 => (0.8612, 6.9200),
+        5 => (-0.3808, 4.0410),
         _ => (0.0, 2.0),
     }
 }

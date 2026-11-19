@@ -201,7 +201,7 @@ pub fn render_boiled_egg_svg(evals: &[MoleculeEvaluation]) -> String {
             out,
             "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"5\" fill=\"{color}\" stroke=\"#111111\" stroke-width=\"0.9\"/>"
         );
-        let safe_name = escape_xml(&e.name);
+        let safe_name = escape_xml(&truncate_label(&e.name, 36));
         let _ = writeln!(
             out,
             "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"Helvetica,sans-serif\" font-size=\"9\" fill=\"#111111\">{safe_name}</text>",
@@ -245,10 +245,22 @@ fn fmt_pts(pts: &[(f64, f64)]) -> String {
         .join(" ")
 }
 
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    let cnt = s.chars().count();
+    if cnt <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        out.push_str("...");
+        out
+    }
+}
+
 fn escape_xml(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() {
+        // Strip ASCII control characters and XML 1.0 Unicode noncharacters (U+FDD0..=U+FDEF, U+FFFE, U+FFFF)
+        if c.is_control() || matches!(c, '\u{FDD0}'..='\u{FDEF}' | '\u{FFFE}' | '\u{FFFF}') {
             out.push(' ');
             continue;
         }

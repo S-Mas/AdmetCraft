@@ -66,6 +66,8 @@ impl SolubilityClass {
 pub struct PhysicochemicalProperties {
     pub formula: String,
     pub molecular_weight: f64,
+    #[serde(default)]
+    pub exact_mass: f64,
     pub heavy_atoms: usize,
     pub aromatic_heavy_atoms: usize,
     pub fraction_csp3: f64,
@@ -73,7 +75,78 @@ pub struct PhysicochemicalProperties {
     pub h_bond_acceptors: usize,
     pub h_bond_donors: usize,
     pub molar_refractivity: f64,
+    /// Ertl (2000) TPSA including N, O, S, and P (SwissADME convention).
     pub tpsa: f64,
+    /// Ertl (2000) TPSA counting N and O only (RDKit / QED convention).
+    #[serde(default)]
+    pub tpsa_no_only: f64,
+    /// Double Bond Equivalents (Rings + Double Bonds).
+    #[serde(default)]
+    pub dbe: f64,
+    #[serde(default)]
+    pub num_rings: usize,
+    #[serde(default)]
+    pub num_aromatic_rings: usize,
+}
+
+/// Dominant physiological ionization state at pH 7.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum IonizationClass {
+    #[default]
+    Neutral,
+    Acid,
+    Base,
+    Zwitterion,
+}
+
+impl IonizationClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Neutral => "Neutral",
+            Self::Acid => "Acid",
+            Self::Base => "Base",
+            Self::Zwitterion => "Zwitterion",
+        }
+    }
+}
+
+/// Physiological pKa, ionization class, and Henderson-Hasselbalch LogD at pH 7.4.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct IonizationProfile {
+    pub strongest_acidic_pka: Option<f64>,
+    pub strongest_basic_pka: Option<f64>,
+    pub ionization_class: IonizationClass,
+    pub estimated_charge_ph74: f64,
+    pub logd_ph74: f64,
+}
+
+/// Qualitative hERG cardiotoxicity structural/physicochemical risk class (heuristic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HergRisk {
+    #[default]
+    Low,
+    Moderate,
+    High,
+}
+
+impl HergRisk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Moderate => "Moderate",
+            Self::High => "High",
+        }
+    }
+}
+
+/// Extended toxicity & reactive-metabolite structural safety screening panel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SafetyProfile {
+    pub herg_risk: HergRisk,
+    pub herg_reasons: Vec<String>,
+    pub ames_alerts: Vec<String>,
+    pub dili_alerts: Vec<String>,
+    pub safety_alerts_are_structural_heuristics: bool,
 }
 
 /// Lipophilicity predictions: 3 distinct models (`XLOGP3`-heuristic, `WLOGP`, `MLOGP`),
@@ -135,14 +208,14 @@ pub struct Pharmacokinetics {
 }
 
 /// Outcome of a druglikeness / leadlikeness rule filter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RuleResult {
     pub pass: bool,
     pub violations: usize,
     pub details: Vec<String>,
 }
 
-/// Druglikeness section (5 pharmaceutical filters + Abbott Bioavailability Score).
+/// Druglikeness section (SwissADME 5 filters + Bickerton QED + Pfizer CNS MPO + Industrial rules).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Druglikeness {
     pub lipinski: RuleResult,
@@ -151,6 +224,27 @@ pub struct Druglikeness {
     pub egan: RuleResult,
     pub muegge: RuleResult,
     pub bioavailability_score: f64,
+    /// Bickerton et al. (2012, *Nature Chemistry*) Quantitative Estimate of Drug-likeness `[0.0, 1.0]`.
+    #[serde(default)]
+    pub qed: f64,
+    /// Wager et al. (2010) Pfizer CNS Multiparameter Optimization score `[0.0, 6.0]`.
+    #[serde(default)]
+    pub cns_mpo: f64,
+    /// Hughes et al. (2008) Pfizer 3/75 in vivo toxicity rule (`pass = !(LogP > 3 && TPSA < 75)`).
+    #[serde(default)]
+    pub pfizer_3_75: RuleResult,
+    /// Gleeson (2008) GSK 4/400 favorable ADMET space (`MW <= 400 && LogP <= 4`).
+    #[serde(default)]
+    pub gsk_4_400: RuleResult,
+    /// Johnson et al. (2009) Golden Triangle (`200 <= MW <= 500 && -2 <= LogD7.4 <= 5`).
+    #[serde(default)]
+    pub golden_triangle: RuleResult,
+    /// Congreve et al. (2003) Fragment Rule of Three (`MW <= 300, LogP <= 3, HBD <= 3, HBA <= 3, RB <= 3`).
+    #[serde(default)]
+    pub ro3_fragment: RuleResult,
+    /// Doak et al. (2014) Beyond Rule of 5 (`MW > 500` or `TPSA > 140` or `HBD > 5` or `RB > 10`).
+    #[serde(default)]
+    pub beyond_ro5: bool,
 }
 
 /// Medicinal Chemistry alerts and scores.
@@ -263,6 +357,32 @@ pub struct MoleculeEvaluation {
     pub pharmacokinetics: Pharmacokinetics,
     pub druglikeness: Druglikeness,
     pub medicinal_chemistry: MedicinalChemistry,
+    #[serde(default)]
+    pub ionization: IonizationProfile,
+    #[serde(default)]
+    pub safety: SafetyProfile,
     pub boiled_egg: BoiledEggPoint,
     pub bioavailability_radar: BioavailabilityRadar,
+}
+
+/// Side-by-side ADMET delta between two molecules (e.g. parent vs analogue / bioisostere).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdmetComparison {
+    pub name_a: String,
+    pub name_b: String,
+    pub smiles_a: String,
+    pub smiles_b: String,
+    pub delta_mw: f64,
+    pub delta_tpsa: f64,
+    pub delta_wlogp: f64,
+    pub delta_consensus_logp: f64,
+    pub delta_logd_ph74: f64,
+    pub delta_esol_log_s: f64,
+    pub delta_qed: f64,
+    pub delta_cns_mpo: f64,
+    pub delta_sa: f64,
+    pub alerts_added: Vec<String>,
+    pub alerts_removed: Vec<String>,
+    pub eval_a: MoleculeEvaluation,
+    pub eval_b: MoleculeEvaluation,
 }

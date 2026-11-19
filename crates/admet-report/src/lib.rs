@@ -91,6 +91,37 @@ mod tests {
     use admet_calc::evaluate_smiles;
     use chem_core::parse_csv_batch;
 
+    fn inflate_pdf_streams(pdf_bytes: &[u8]) -> String {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+        let mut combined = String::new();
+        let needle_start = b"stream\n";
+        let needle_end = b"\nendstream";
+        let mut pos = 0usize;
+        while let Some(rel) = pdf_bytes[pos..]
+            .windows(needle_start.len())
+            .position(|w| w == needle_start)
+        {
+            let s_start = pos + rel + needle_start.len();
+            let Some(e_rel) = pdf_bytes[s_start..]
+                .windows(needle_end.len())
+                .position(|w| w == needle_end)
+            else {
+                break;
+            };
+            let chunk = &pdf_bytes[s_start..s_start + e_rel];
+            let mut dec = ZlibDecoder::new(chunk);
+            let mut out = String::new();
+            if dec.read_to_string(&mut out).is_ok() {
+                combined.push_str(&out);
+            } else {
+                combined.push_str(&String::from_utf8_lossy(chunk));
+            }
+            pos = s_start + e_rel + needle_end.len();
+        }
+        combined
+    }
+
     #[test]
     fn exports_csv_json_svg_and_valid_pdf() -> Result<(), Box<dyn std::error::Error>> {
         let evals = vec![
@@ -100,6 +131,8 @@ mod tests {
         let csv_str = export_csv_string(&evals)?;
         assert!(csv_str.contains("Aspirina, ácido"));
         assert!(csv_str.contains("Consensus Log P"));
+        assert!(csv_str.contains("QED (Bickerton 2012)"));
+        assert!(csv_str.contains("CNS MPO (Pfizer)"));
 
         // Verify exported CSV roundtrips cleanly back through chem_core::parse_csv_batch!
         let reimported = parse_csv_batch(&csv_str)?;
@@ -122,10 +155,13 @@ mod tests {
         let pdf_bytes = export_pdf_bytes(&evals)?;
         assert!(pdf_bytes.starts_with(b"%PDF-1.4"));
         assert!(pdf_bytes.ends_with(b"%%EOF\n"));
-        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
-        assert!(pdf_text.contains("/Encoding /WinAnsiEncoding"));
+        let pdf_raw = String::from_utf8_lossy(&pdf_bytes);
+        assert!(pdf_raw.contains("/Encoding /WinAnsiEncoding"));
+        assert!(pdf_raw.contains("/Filter /FlateDecode"));
+        let inflated = inflate_pdf_streams(&pdf_bytes);
         // Cafeína uses octal \355 for í instead of '?'
-        assert!(pdf_text.contains("Cafe\\355na"));
+        assert!(inflated.contains("Cafe\\355na"));
+        assert!(inflated.contains("QED / CNS MPO"));
         Ok(())
     }
 
@@ -136,17 +172,17 @@ mod tests {
             evals.push(evaluate_smiles("CCO", Some(&format!("Mol_{i}")))?);
         }
         let pdf_bytes = export_pdf_bytes(&evals)?;
-        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+        let inflated = inflate_pdf_streams(&pdf_bytes);
         // Continuation summary page must contain Mol_25..Mol_30 (PDF escapes parens)!
-        assert!(pdf_text.contains("Summary Table \\(continued: 25..30 of 30\\)"));
-        assert!(pdf_text.contains("Mol_30"));
+        assert!(inflated.contains("Summary Table \\(continued: 25..30 of 30\\)"));
+        assert!(inflated.contains("Mol_30"));
         Ok(())
     }
 
     #[test]
     fn csv_sanitizes_formula_injection_and_svg_strips_control_chars()
     -> Result<(), Box<dyn std::error::Error>> {
-        let dangerous_name = "=CMD|' /C calc'!A0\x00\x1b<script>&\"";
+        let dangerous_name = "=CMD|' /C calc'!A0\x00\x1b<script>&\"\u{FFFE}\u{FFFF}";
         let eval = evaluate_smiles("CCO", Some(dangerous_name))?;
         let csv_out = export_csv_string(std::slice::from_ref(&eval))?;
         assert!(
@@ -159,6 +195,7 @@ mod tests {
             !svg.chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\r')
         );
+        assert!(!svg.contains('\u{FFFE}') && !svg.contains('\u{FFFF}'));
         assert!(svg.contains("&lt;script&gt;&amp;&quot;"));
         Ok(())
     }

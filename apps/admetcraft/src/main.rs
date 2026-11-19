@@ -90,23 +90,37 @@ impl AdmetCraftApp {
         }
     }
 
+    fn sync_sketcher_to_selection(&mut self) {
+        let selected_eval = self
+            .session
+            .selected_index
+            .and_then(|idx| self.session.evaluations.get(idx))
+            .or_else(|| self.session.evaluations.first());
+        if let Some(ev) = selected_eval {
+            let _ = self.sketcher.load_smiles(&ev.canonical_smiles);
+        } else {
+            self.sketcher.clear();
+        }
+    }
+
     fn run_command(&mut self, cmd: Command) {
-        let is_history_nav = matches!(cmd, Command::Undo | Command::Redo);
+        let should_sync_sketcher = matches!(
+            cmd,
+            Command::Undo
+                | Command::Redo
+                | Command::FilterBatch { .. }
+                | Command::ClearSession
+                | Command::LoadExampleBatch
+                | Command::ImportSdf { .. }
+                | Command::ImportCsv { .. }
+                | Command::SelectMolecule { .. }
+        );
         match CommandRegistry::execute(&mut self.session, cmd) {
             Ok(out) => {
                 self.status_msg = out.message;
                 self.rebuild_mol_cache();
-                if is_history_nav {
-                    let selected_eval = self
-                        .session
-                        .selected_index
-                        .and_then(|idx| self.session.evaluations.get(idx))
-                        .or_else(|| self.session.evaluations.first());
-                    if let Some(ev) = selected_eval {
-                        let _ = self.sketcher.load_smiles(&ev.canonical_smiles);
-                    } else {
-                        self.sketcher.clear();
-                    }
+                if should_sync_sketcher || self.session.evaluations.is_empty() {
+                    self.sync_sketcher_to_selection();
                 }
             }
             Err(e) => self.status_msg = format!("Error: {e}"),
@@ -115,7 +129,7 @@ impl AdmetCraftApp {
 
     /// Export asynchronously on a background thread using `PathSandbox::open_write` so the UI
     /// thread never freezes on large PDFs and symlink/traversal escapes are blocked.
-    fn export(&mut self, format: ExportFormat, filename: &str) {
+    fn export(&mut self, ctx: &egui::Context, format: ExportFormat, filename: &str) {
         if self.session.evaluations.is_empty() {
             self.status_msg = "No molecules to export".to_string();
             return;
@@ -131,6 +145,7 @@ impl AdmetCraftApp {
         let target_name = PathBuf::from(filename);
         let evals = self.session.evaluations.clone();
         let status_slot = Arc::clone(&self.async_status);
+        let repaint_ctx = ctx.clone();
         self.status_msg = format!("Exporting {filename} in background...");
 
         std::thread::spawn(move || {
@@ -145,7 +160,46 @@ impl AdmetCraftApp {
             if let Ok(mut guard) = status_slot.lock() {
                 *guard = Some(msg);
             }
+            repaint_ctx.request_repaint();
         });
+    }
+
+    /// Open a native Linux file dialog (`zenity` or `kdialog`) without adding external crate deps.
+    fn browse_import_file(&mut self) {
+        let picked = std::process::Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--title=Import Molecules (.smi, .csv, .sdf)",
+                "--file-filter=Chemical files | *.smi *.smiles *.csv *.sdf *.mol *.txt",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .or_else(|| {
+                std::process::Command::new("kdialog")
+                    .args([
+                        "--getopenfilename",
+                        &self.export_dir,
+                        "*.smi *.smiles *.csv *.sdf *.mol | Chemical files",
+                    ])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+            });
+
+        let Some(output) = picked else {
+            self.status_msg =
+                "File picker cancelled (or install zenity/kdialog, or drag-and-drop a file)"
+                    .to_string();
+            return;
+        };
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        self.import_path = raw.clone();
+        let path = PathBuf::from(raw);
+        self.import_file_path(&path, true);
     }
 
     /// Import a `.smi`, `.csv`, or `.sdf` file inside `export_dir` (or the file's parent for
@@ -386,19 +440,28 @@ impl AdmetCraftApp {
                 "filter_lipinski_0" => self.run_command(Command::FilterBatch {
                     criteria: FilterCriteria {
                         max_lipinski_violations: Some(0),
-                        require_bbb: None,
-                        require_gi_high: None,
                         no_pains: true,
-                        no_brenk: false,
+                        ..FilterCriteria::default()
                     },
                 }),
                 "filter_bbb_yes" => self.run_command(Command::FilterBatch {
                     criteria: FilterCriteria {
-                        max_lipinski_violations: None,
                         require_bbb: Some(true),
-                        require_gi_high: None,
-                        no_pains: false,
-                        no_brenk: false,
+                        ..FilterCriteria::default()
+                    },
+                }),
+                "filter_qed_05" => self.run_command(Command::FilterBatch {
+                    criteria: FilterCriteria {
+                        min_qed: Some(0.50),
+                        no_pains: true,
+                        ..FilterCriteria::default()
+                    },
+                }),
+                "filter_cns_mpo_4" => self.run_command(Command::FilterBatch {
+                    criteria: FilterCriteria {
+                        min_cns_mpo: Some(4.0),
+                        require_bbb: Some(true),
+                        ..FilterCriteria::default()
                     },
                 }),
                 "clear_session" => self.run_command(Command::ClearSession),
@@ -468,16 +531,16 @@ impl eframe::App for AdmetCraftApp {
                 }
                 ui.separator();
                 if ui.button("CSV").clicked() {
-                    self.export(ExportFormat::Csv, "admetcraft_report.csv");
+                    self.export(ctx, ExportFormat::Csv, "admetcraft_report.csv");
                 }
                 if ui.button("JSON").clicked() {
-                    self.export(ExportFormat::Json, "admetcraft_report.json");
+                    self.export(ctx, ExportFormat::Json, "admetcraft_report.json");
                 }
                 if ui.button("PDF").clicked() {
-                    self.export(ExportFormat::Pdf, "admetcraft_report.pdf");
+                    self.export(ctx, ExportFormat::Pdf, "admetcraft_report.pdf");
                 }
                 if ui.button("Egg SVG").clicked() {
-                    self.export(ExportFormat::SvgBoiledEgg, "admetcraft_boiled_egg.svg");
+                    self.export(ctx, ExportFormat::SvgBoiledEgg, "admetcraft_boiled_egg.svg");
                 }
                 ui.separator();
                 if ui
@@ -561,12 +624,15 @@ impl eframe::App for AdmetCraftApp {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.import_path)
-                                .desired_width(210.0)
+                                .desired_width(165.0)
                                 .hint_text("molecules.smi"),
                         );
                         if ui.button("Load").clicked() && !self.import_path.trim().is_empty() {
                             let p = PathBuf::from(self.import_path.trim());
                             self.import_file_path(&p, false);
+                        }
+                        if ui.button("Browse...").clicked() {
+                            self.browse_import_file();
                         }
                     });
 
@@ -593,32 +659,47 @@ impl eframe::App for AdmetCraftApp {
                     self.run_command(Command::FilterBatch {
                         criteria: FilterCriteria {
                             max_lipinski_violations: Some(0),
-                            require_bbb: None,
-                            require_gi_high: None,
-                            no_pains: false,
-                            no_brenk: false,
+                            ..FilterCriteria::default()
                         },
                     });
                 }
                 if ui.small_button("Filter: BBB+").clicked() {
                     self.run_command(Command::FilterBatch {
                         criteria: FilterCriteria {
-                            max_lipinski_violations: None,
                             require_bbb: Some(true),
-                            require_gi_high: None,
-                            no_pains: false,
-                            no_brenk: false,
+                            ..FilterCriteria::default()
                         },
                     });
                 }
                 if ui.small_button("Filter: No PAINS").clicked() {
                     self.run_command(Command::FilterBatch {
                         criteria: FilterCriteria {
-                            max_lipinski_violations: None,
-                            require_bbb: None,
-                            require_gi_high: None,
                             no_pains: true,
-                            no_brenk: false,
+                            ..FilterCriteria::default()
+                        },
+                    });
+                }
+                if ui.small_button("Filter: QED>=0.5").clicked() {
+                    self.run_command(Command::FilterBatch {
+                        criteria: FilterCriteria {
+                            min_qed: Some(0.50),
+                            ..FilterCriteria::default()
+                        },
+                    });
+                }
+                if ui.small_button("Filter: CNS MPO>=4").clicked() {
+                    self.run_command(Command::FilterBatch {
+                        criteria: FilterCriteria {
+                            min_cns_mpo: Some(4.0),
+                            ..FilterCriteria::default()
+                        },
+                    });
+                }
+                if ui.small_button("Filter: Low/Mod hERG").clicked() {
+                    self.run_command(Command::FilterBatch {
+                        criteria: FilterCriteria {
+                            no_high_herg: true,
+                            ..FilterCriteria::default()
                         },
                     });
                 }
@@ -736,8 +817,61 @@ impl AdmetCraftApp {
                     });
                 });
 
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    let qed_col = if eval.druglikeness.qed >= 0.67 {
+                        Color32::from_rgb(35, 145, 70)
+                    } else if eval.druglikeness.qed >= 0.45 {
+                        Color32::from_rgb(185, 125, 20)
+                    } else {
+                        Color32::from_rgb(195, 50, 50)
+                    };
+                    let mpo_col = if eval.druglikeness.cns_mpo >= 4.0 {
+                        Color32::from_rgb(35, 145, 70)
+                    } else {
+                        Color32::from_rgb(120, 120, 130)
+                    };
+                    let herg_col = match eval.safety.herg_risk {
+                        admet_calc::HergRisk::Low => Color32::from_rgb(35, 145, 70),
+                        admet_calc::HergRisk::Moderate => Color32::from_rgb(185, 125, 20),
+                        admet_calc::HergRisk::High => Color32::from_rgb(195, 50, 50),
+                    };
+                    ui.colored_label(
+                        qed_col,
+                        RichText::new(format!("QED: {:.3}", eval.druglikeness.qed)).strong(),
+                    );
+                    ui.separator();
+                    ui.colored_label(
+                        mpo_col,
+                        RichText::new(format!("CNS MPO: {:.2}/6.0", eval.druglikeness.cns_mpo))
+                            .strong(),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!(
+                            "LogD7.4: {:.2} ({})",
+                            eval.ionization.logd_ph74,
+                            eval.ionization.ionization_class.as_str()
+                        ))
+                        .strong(),
+                    );
+                    ui.separator();
+                    ui.colored_label(
+                        herg_col,
+                        RichText::new(format!("hERG: {}", eval.safety.herg_risk.as_str())).strong(),
+                    );
+                    ui.separator();
+                    ui.label(format!(
+                        "PAINS: {} | Brenk: {} | AMES: {} | DILI: {}",
+                        eval.medicinal_chemistry.pains_alerts.len(),
+                        eval.medicinal_chemistry.brenk_alerts.len(),
+                        eval.safety.ames_alerts.len(),
+                        eval.safety.dili_alerts.len()
+                    ));
+                });
+
                 ui.add_space(8.0);
-                render_six_sections(ui, &eval);
+                render_admet_sections(ui, &eval);
             });
     }
 
@@ -746,21 +880,12 @@ impl AdmetCraftApp {
         egui::ScrollArea::both().show(ui, |ui| {
             egui::Grid::new("batch_summary_grid")
                 .striped(true)
-                .spacing([14.0, 6.0])
+                .spacing([12.0, 6.0])
                 .show(ui, |ui| {
                     for h in [
-                        "Molecule",
-                        "Formula",
-                        "MW",
-                        "TPSA",
-                        "cLogP",
-                        "ESOL LogS",
-                        "GI",
-                        "BBB",
-                        "P-gp (exp.)",
-                        "Lipinski",
-                        "PAINS",
-                        "SA (proxy)",
+                        "Molecule", "Formula", "MW", "TPSA", "cLogP", "LogD7.4", "State", "ESOL",
+                        "QED", "CNS MPO", "GI", "BBB", "Lipinski", "PAINS", "Brenk", "hERG",
+                        "AMES", "DILI", "SA",
                     ] {
                         ui.strong(h);
                     }
@@ -777,10 +902,13 @@ impl AdmetCraftApp {
                         ui.label(format!("{:.2}", e.physicochemical.molecular_weight));
                         ui.label(format!("{:.2}", e.physicochemical.tpsa));
                         ui.label(format!("{:.2}", e.lipophilicity.consensus_log_p));
+                        ui.label(format!("{:.2}", e.ionization.logd_ph74));
+                        ui.label(e.ionization.ionization_class.as_str());
                         ui.label(format!("{:.2}", e.water_solubility.esol.log_s));
+                        ui.label(format!("{:.3}", e.druglikeness.qed));
+                        ui.label(format!("{:.2}", e.druglikeness.cns_mpo));
                         ui.label(e.pharmacokinetics.gi_absorption.as_str());
                         ui.label(yes_no(e.pharmacokinetics.bbb_permeant));
-                        ui.label(yes_no(e.pharmacokinetics.pgp_substrate));
                         ui.label(format!(
                             "{} ({})",
                             yes_no(e.druglikeness.lipinski.pass),
@@ -791,6 +919,14 @@ impl AdmetCraftApp {
                             e.medicinal_chemistry.pains_alerts.len(),
                             e.medicinal_chemistry.pains_catalog_size
                         ));
+                        ui.label(format!(
+                            "{}/{}",
+                            e.medicinal_chemistry.brenk_alerts.len(),
+                            e.medicinal_chemistry.brenk_catalog_size
+                        ));
+                        ui.label(e.safety.herg_risk.as_str());
+                        ui.label(e.safety.ames_alerts.len().to_string());
+                        ui.label(e.safety.dili_alerts.len().to_string());
                         ui.label(format!(
                             "{:.2}",
                             e.medicinal_chemistry.synthetic_accessibility
@@ -809,13 +945,15 @@ impl AdmetCraftApp {
     }
 }
 
-fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
+fn render_admet_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
     let p = &e.physicochemical;
     let l = &e.lipophilicity;
+    let ion = &e.ionization;
     let w = &e.water_solubility;
     let pk = &e.pharmacokinetics;
     let d = &e.druglikeness;
     let mc = &e.medicinal_chemistry;
+    let s = &e.safety;
 
     egui::CollapsingHeader::new("Physicochemical Properties")
         .default_open(true)
@@ -829,21 +967,42 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                         "Molecular weight",
                         format!("{:.2} g/mol", p.molecular_weight),
                     ),
+                    (
+                        "Exact mass (monoisotopic)",
+                        format!("{:.4} Da", p.exact_mass),
+                    ),
                     ("Num. heavy atoms", p.heavy_atoms.to_string()),
                     ("Num. arom. heavy atoms", p.aromatic_heavy_atoms.to_string()),
+                    (
+                        "Rings / Aromatic rings",
+                        format!("{} / {}", p.num_rings, p.num_aromatic_rings),
+                    ),
+                    ("DBE (unsaturation)", format!("{:.1}", p.dbe)),
                     ("Fraction Csp3", format!("{:.2}", p.fraction_csp3)),
                     ("Num. rotatable bonds", p.rotatable_bonds.to_string()),
                     ("Num. H-bond acceptors", p.h_bond_acceptors.to_string()),
                     ("Num. H-bond donors", p.h_bond_donors.to_string()),
                     ("Molar Refractivity", format!("{:.2}", p.molar_refractivity)),
-                    ("TPSA", format!("{:.2} A^2", p.tpsa)),
+                    ("TPSA (S & P, SwissADME)", format!("{:.2} A^2", p.tpsa)),
+                    (
+                        "TPSA (N & O only, RDKit)",
+                        format!("{:.2} A^2", p.tpsa_no_only),
+                    ),
                 ],
             );
         });
 
-    egui::CollapsingHeader::new("Lipophilicity")
+    egui::CollapsingHeader::new("Lipophilicity & Ionization (pH 7.4)")
         .default_open(true)
         .show(ui, |ui| {
+            let pka_a = ion
+                .strongest_acidic_pka
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "None".to_string());
+            let pka_b = ion
+                .strongest_basic_pka
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "None".to_string());
             kv_grid(
                 ui,
                 "lipo_grid",
@@ -863,6 +1022,20 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                         "Consensus Log Po/w (3-model)",
                         format!("{:.2}", l.consensus_log_p),
                     ),
+                    (
+                        "LogD @ pH 7.4 (Henderson-Hasselbalch)",
+                        format!("{:.2}", ion.logd_ph74),
+                    ),
+                    (
+                        "Ionization state @ pH 7.4",
+                        format!(
+                            "{} (est. charge {:+.2})",
+                            ion.ionization_class.as_str(),
+                            ion.estimated_charge_ph74
+                        ),
+                    ),
+                    ("Strongest Acidic pKa (heur.)", pka_a),
+                    ("Strongest Basic pKa (heur.)", pka_b),
                 ],
             );
         });
@@ -949,27 +1122,37 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
             );
         });
 
-    egui::CollapsingHeader::new("Druglikeness")
+    egui::CollapsingHeader::new("Druglikeness & Industrial MedChem Rules")
         .default_open(true)
         .show(ui, |ui| {
             kv_grid(
                 ui,
                 "drug_grid",
                 &[
-                    ("Lipinski", fmt_rule(&d.lipinski)),
+                    ("QED (Bickerton 2012)", format!("{:.3} / 1.000", d.qed)),
+                    (
+                        "Pfizer CNS MPO (Wager 2010)",
+                        format!("{:.2} / 6.00", d.cns_mpo),
+                    ),
+                    ("Lipinski (Ro5)", fmt_rule(&d.lipinski)),
                     ("Ghose", fmt_rule(&d.ghose)),
                     ("Veber", fmt_rule(&d.veber)),
                     ("Egan", fmt_rule(&d.egan)),
                     ("Muegge", fmt_rule(&d.muegge)),
+                    ("Pfizer 3/75 (Toxicity Risk)", fmt_rule(&d.pfizer_3_75)),
+                    ("GSK 4/400 (ADMET Risk)", fmt_rule(&d.gsk_4_400)),
+                    ("Golden Triangle (MW/LogD)", fmt_rule(&d.golden_triangle)),
+                    ("Rule of Three (Fragment Ro3)", fmt_rule(&d.ro3_fragment)),
+                    ("Beyond Ro5 (bRo5)", yes_no(d.beyond_ro5).to_string()),
                     (
-                        "Bioavailability Score",
+                        "Bioavailability Score (Abbott)",
                         format!("{:.2}", d.bioavailability_score),
                     ),
                 ],
             );
         });
 
-    egui::CollapsingHeader::new("Medicinal Chemistry")
+    egui::CollapsingHeader::new("Medicinal Chemistry & Safety Alerts")
         .default_open(true)
         .show(ui, |ui| {
             let pains_txt = if mc.pains_alerts.is_empty() {
@@ -998,6 +1181,21 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                     mc.brenk_alerts.join(", ")
                 )
             };
+            let herg_txt = if s.herg_reasons.is_empty() {
+                s.herg_risk.as_str().to_string()
+            } else {
+                format!("{} ({})", s.herg_risk.as_str(), s.herg_reasons.join("; "))
+            };
+            let ames_txt = if s.ames_alerts.is_empty() {
+                "0 alerts".to_string()
+            } else {
+                format!("{}: {}", s.ames_alerts.len(), s.ames_alerts.join(", "))
+            };
+            let dili_txt = if s.dili_alerts.is_empty() {
+                "0 alerts".to_string()
+            } else {
+                format!("{}: {}", s.dili_alerts.len(), s.dili_alerts.join(", "))
+            };
             kv_grid(
                 ui,
                 "mc_grid",
@@ -1009,6 +1207,9 @@ fn render_six_sections(ui: &mut egui::Ui, e: &MoleculeEvaluation) {
                         "SA score (heuristic proxy)",
                         format!("{:.2}", mc.synthetic_accessibility),
                     ),
+                    ("hERG Risk (heur.)", herg_txt),
+                    ("AMES Mutagenicity (heur.)", ames_txt),
+                    ("DILI Reactive Met. (heur.)", dili_txt),
                 ],
             );
         });

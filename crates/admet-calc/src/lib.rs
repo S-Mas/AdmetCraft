@@ -4,12 +4,15 @@
 #![forbid(unsafe_code)]
 
 pub mod druglikeness;
+pub mod ionization;
 pub mod lipophilicity;
 pub mod medchem;
 pub mod pharmacokinetics;
 pub mod physicochem;
 pub mod solubility;
 pub mod types;
+
+use std::collections::BTreeSet;
 
 use chem_core::{ChemError, Molecule, parse_smiles};
 use rayon::prelude::*;
@@ -42,13 +45,22 @@ pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
 
     let physicochemical = physicochem::compute_physicochemical(mol);
     let lipophilicity = lipophilicity::compute_lipophilicity(mol);
+    let ionization = ionization::compute_ionization(mol, &lipophilicity);
     let water_solubility =
         solubility::compute_water_solubility(mol, &physicochemical, &lipophilicity);
     let (pharmacokinetics, boiled_egg) =
         pharmacokinetics::compute_pharmacokinetics(mol, &physicochemical, &lipophilicity);
-    let druglikeness = druglikeness::compute_druglikeness(mol, &physicochemical, &lipophilicity);
     let medicinal_chemistry =
         medchem::compute_medicinal_chemistry(mol, &physicochemical, &lipophilicity);
+    let druglikeness = druglikeness::compute_druglikeness(
+        mol,
+        &physicochemical,
+        &lipophilicity,
+        &ionization,
+        medicinal_chemistry.brenk_alerts.len(),
+    );
+    let safety =
+        medchem::compute_safety_profile(mol, &physicochemical, &lipophilicity, &ionization);
     let bioavailability_radar = compute_radar(&physicochemical, &lipophilicity, &water_solubility);
 
     MoleculeEvaluation {
@@ -62,9 +74,70 @@ pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
         pharmacokinetics,
         druglikeness,
         medicinal_chemistry,
+        ionization,
+        safety,
         boiled_egg,
         bioavailability_radar,
     }
+}
+
+/// Compare two evaluated molecules side by side (delta ADMET, QED, CNS MPO, LogD7.4, and alert diff).
+pub fn compare_evaluations(a: MoleculeEvaluation, b: MoleculeEvaluation) -> AdmetComparison {
+    let r2 = physicochem::round2;
+    let r3 = |v: f64| (v * 1000.0).round() / 1000.0;
+    let collect_alerts = |ev: &MoleculeEvaluation| -> BTreeSet<String> {
+        let mut s = BTreeSet::new();
+        for x in &ev.medicinal_chemistry.pains_alerts {
+            s.insert(format!("PAINS:{x}"));
+        }
+        for x in &ev.medicinal_chemistry.brenk_alerts {
+            s.insert(format!("Brenk:{x}"));
+        }
+        for x in &ev.safety.ames_alerts {
+            s.insert(format!("AMES:{x}"));
+        }
+        for x in &ev.safety.dili_alerts {
+            s.insert(format!("DILI:{x}"));
+        }
+        s
+    };
+    let set_a = collect_alerts(&a);
+    let set_b = collect_alerts(&b);
+    let alerts_added = set_b.difference(&set_a).cloned().collect();
+    let alerts_removed = set_a.difference(&set_b).cloned().collect();
+
+    AdmetComparison {
+        name_a: a.name.clone(),
+        name_b: b.name.clone(),
+        smiles_a: a.canonical_smiles.clone(),
+        smiles_b: b.canonical_smiles.clone(),
+        delta_mw: r2(b.physicochemical.molecular_weight - a.physicochemical.molecular_weight),
+        delta_tpsa: r2(b.physicochemical.tpsa - a.physicochemical.tpsa),
+        delta_wlogp: r2(b.lipophilicity.wlogp - a.lipophilicity.wlogp),
+        delta_consensus_logp: r2(b.lipophilicity.consensus_log_p - a.lipophilicity.consensus_log_p),
+        delta_logd_ph74: r2(b.ionization.logd_ph74 - a.ionization.logd_ph74),
+        delta_esol_log_s: r2(b.water_solubility.esol.log_s - a.water_solubility.esol.log_s),
+        delta_qed: r3(b.druglikeness.qed - a.druglikeness.qed),
+        delta_cns_mpo: r2(b.druglikeness.cns_mpo - a.druglikeness.cns_mpo),
+        delta_sa: r2(b.medicinal_chemistry.synthetic_accessibility
+            - a.medicinal_chemistry.synthetic_accessibility),
+        alerts_added,
+        alerts_removed,
+        eval_a: a,
+        eval_b: b,
+    }
+}
+
+/// Evaluate and compare two SMILES strings side by side.
+pub fn compare_smiles(
+    smiles_a: &str,
+    name_a: Option<&str>,
+    smiles_b: &str,
+    name_b: Option<&str>,
+) -> Result<AdmetComparison, AdmetError> {
+    let a = evaluate_smiles(smiles_a, name_a)?;
+    let b = evaluate_smiles(smiles_b, name_b)?;
+    Ok(compare_evaluations(a, b))
 }
 
 /// Parse a SMILES string and evaluate all ADMET properties.
@@ -329,9 +402,61 @@ mod tests {
 
         let aspirin = evaluate_smiles("CC(=O)Oc1ccccc1C(=O)O", Some("Aspirin"))?;
         assert!(aspirin.medicinal_chemistry.pains_alerts.is_empty());
-        assert_eq!(aspirin.medicinal_chemistry.pains_catalog_size, 26);
-        assert_eq!(aspirin.medicinal_chemistry.brenk_catalog_size, 25);
+        assert_eq!(
+            aspirin.medicinal_chemistry.pains_catalog_size,
+            medchem::PAINS_CATALOG_SIZE
+        );
+        assert_eq!(
+            aspirin.medicinal_chemistry.brenk_catalog_size,
+            medchem::BRENK_CATALOG_SIZE
+        );
         assert!(aspirin.medicinal_chemistry.sa_is_heuristic_proxy);
+
+        // Verify QED, CNS MPO, Ionization/LogD7.4, Industrial rules & Safety panel
+        let ibu = evaluate_smiles("CC(C)Cc1ccc(C(C)C(=O)O)cc1", Some("Ibuprofen"))?;
+        assert!(
+            (ibu.druglikeness.qed - 0.822).abs() < 0.06,
+            "ibu QED={}",
+            ibu.druglikeness.qed
+        );
+        assert_eq!(ibu.ionization.ionization_class, IonizationClass::Acid);
+        assert!(ibu.ionization.logd_ph74 < ibu.lipophilicity.consensus_log_p - 1.5);
+        assert_eq!(ibu.safety.herg_risk, HergRisk::Low);
+
+        let diaz = evaluate_smiles("CN1C(=O)CN=C(c2ccccc2)c2cc(Cl)ccc21", Some("Diazepam"))?;
+        assert!(
+            diaz.druglikeness.cns_mpo >= 4.0,
+            "diazepam CNS MPO={}",
+            diaz.druglikeness.cns_mpo
+        );
+        assert!(diaz.medicinal_chemistry.brenk_alerts.is_empty());
+
+        // Verify [Br] SMARTS parsing fix (Benzyl bromide -> alkyl_halide & AMES alert)
+        let bbr = evaluate_smiles("BrCc1ccccc1", Some("Benzyl_bromide"))?;
+        assert!(
+            bbr.medicinal_chemistry
+                .brenk_alerts
+                .iter()
+                .any(|a| a == "alkyl_halide"),
+            "Benzyl bromide missed alkyl_halide: {:?}",
+            bbr.medicinal_chemistry.brenk_alerts
+        );
+        assert!(
+            bbr.safety
+                .ames_alerts
+                .iter()
+                .any(|a| a == "alkyl_halide_mutagen"),
+            "Benzyl bromide missed AMES alert: {:?}",
+            bbr.safety.ames_alerts
+        );
+
+        let cmp = compare_smiles(
+            "CC(C)Cc1ccc(C(C)C(=O)O)cc1",
+            Some("Ibuprofen"),
+            "CC(C)Cc1ccc(C(C)c2nnn[nH]2)cc1",
+            Some("Ibu_Tetrazole"),
+        )?;
+        assert!(cmp.delta_tpsa > 15.0);
         Ok(())
     }
 

@@ -45,7 +45,18 @@ pub struct PathSandbox {
 
 impl PathSandbox {
     /// Create a sandbox with optional canonicalized read and write roots.
+    /// Existing write roots are required unless `create_write_root` is enabled via
+    /// [`PathSandbox::new_with_options`].
     pub fn new(read_root: Option<&Path>, write_root: Option<&Path>) -> Result<Self, SandboxError> {
+        Self::new_with_options(read_root, write_root, true)
+    }
+
+    /// Create a sandbox with explicit control over whether a missing `write_root` may be created.
+    pub fn new_with_options(
+        read_root: Option<&Path>,
+        write_root: Option<&Path>,
+        create_write_root: bool,
+    ) -> Result<Self, SandboxError> {
         let r = match read_root {
             Some(p) => Some(std::fs::canonicalize(p)?),
             None => None,
@@ -53,7 +64,17 @@ impl PathSandbox {
         let w = match write_root {
             Some(p) => {
                 if !p.exists() {
-                    std::fs::create_dir_all(p)?;
+                    if create_write_root {
+                        std::fs::create_dir_all(p)?;
+                    } else {
+                        return Err(SandboxError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "write-root '{}' does not exist (create it first or pass --create-write-root)",
+                                p.display()
+                            ),
+                        )));
+                    }
                 }
                 Some(std::fs::canonicalize(p)?)
             }

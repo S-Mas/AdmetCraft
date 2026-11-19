@@ -2,10 +2,12 @@ use chem_core::{BondOrder, Hybridization, Molecule};
 
 use crate::types::PhysicochemicalProperties;
 
-/// Compute all physicochemical descriptors for `mol` with SwissADME/OpenBabel conventions.
+/// Compute all physicochemical descriptors for `mol` with SwissADME/OpenBabel conventions
+/// plus exact monoisotopic mass, DBE, and N/O-only TPSA (RDKit/QED convention).
 pub fn compute_physicochemical(mol: &Molecule) -> PhysicochemicalProperties {
     let formula = mol.formula();
     let molecular_weight = round2(mol.molecular_weight());
+    let exact_mass = round4(compute_exact_mass(mol));
     let heavy_atoms = mol.heavy_atom_count();
     let aromatic_heavy_atoms = mol.aromatic_heavy_atom_count();
     let fraction_csp3 = round2(compute_fsp3(mol));
@@ -13,11 +15,20 @@ pub fn compute_physicochemical(mol: &Molecule) -> PhysicochemicalProperties {
     let h_bond_donors = count_hbd(mol);
     let h_bond_acceptors = count_hba(mol);
     let tpsa = round2(compute_tpsa_ertl(mol));
+    let tpsa_no_only = round2(compute_tpsa_no_only(mol));
+    let dbe = round1(compute_dbe(mol));
+    let num_rings = mol.rings.len();
+    let num_aromatic_rings = mol
+        .rings
+        .iter()
+        .filter(|r| !r.is_empty() && r.iter().all(|&aid| mol.atoms[aid].aromatic))
+        .count();
     let (_, mr) = crate::lipophilicity::compute_wlogp_and_mr(mol);
 
     PhysicochemicalProperties {
         formula,
         molecular_weight,
+        exact_mass,
         heavy_atoms,
         aromatic_heavy_atoms,
         fraction_csp3,
@@ -26,7 +37,74 @@ pub fn compute_physicochemical(mol: &Molecule) -> PhysicochemicalProperties {
         h_bond_donors,
         molar_refractivity: round2(mr),
         tpsa,
+        tpsa_no_only,
+        dbe,
+        num_rings,
+        num_aromatic_rings,
     }
+}
+
+/// Exact monoisotopic IUPAC molecular mass (most abundant natural isotopes, with electron-mass charge correction).
+pub fn compute_exact_mass(mol: &Molecule) -> f64 {
+    const ELECTRON: f64 = 0.000_548_579_9;
+    const H_MONO: f64 = 1.007_825_032_2;
+    let mut sum = 0.0_f64;
+    let mut net_charge: i32 = 0;
+    for a in &mol.atoms {
+        net_charge += i32::from(a.formal_charge);
+        let atom_m = if let Some(iso) = a.isotope {
+            f64::from(iso)
+        } else {
+            match a.atomic_number {
+                1 => H_MONO,
+                5 => 11.009_305_36,
+                6 => 12.000_000_0,
+                7 => 14.003_074_004,
+                8 => 15.994_914_620,
+                9 => 18.998_403_163,
+                11 => 22.989_769_282,
+                12 => 23.985_041_697,
+                14 => 27.976_926_535,
+                15 => 30.973_761_998,
+                16 => 31.972_071_174,
+                17 => 34.968_852_682,
+                19 => 38.963_706_486,
+                20 => 39.962_590_863,
+                26 => 55.934_936_33,
+                30 => 63.929_142_01,
+                34 => 79.916_521_8,
+                35 => 78.918_337_6,
+                53 => 126.904_471_9,
+                _ => {
+                    chem_core::element_by_number(a.atomic_number).map_or(12.0, |e| e.atomic_weight)
+                }
+            }
+        };
+        sum += atom_m + f64::from(a.total_h()) * H_MONO;
+    }
+    sum - (net_charge as f64) * ELECTRON
+}
+
+/// Double Bond Equivalents (Rings + Double Bonds): `C + Si - (H + X)/2 + (N + P)/2 + 1`.
+pub fn compute_dbe(mol: &Molecule) -> f64 {
+    if mol.atoms.is_empty() {
+        return 0.0;
+    }
+    let mut c = 0.0_f64;
+    let mut h = 0.0_f64;
+    let mut x = 0.0_f64;
+    let mut n = 0.0_f64;
+    for a in &mol.atoms {
+        h += f64::from(a.total_h());
+        match a.atomic_number {
+            1 => h += 1.0,
+            6 | 14 => c += 1.0,
+            7 | 15 => n += 1.0,
+            9 | 17 | 35 | 53 => x += 1.0,
+            _ => {}
+        }
+    }
+    c - 0.5 * (h + x) + 0.5 * n + 1.0
 }
 
 /// Fraction of sp3-hybridized carbons (`C_sp3 / C_total`).
@@ -192,10 +270,19 @@ pub fn count_hba(mol: &Molecule) -> usize {
 /// Ertl, Rohde, Selzer (2000) *J. Med. Chem.* 43, 3714-3717 Topological Polar Surface Area (TPSA)
 /// including N, O, S, and P contributions (SwissADME convention).
 pub fn compute_tpsa_ertl(mol: &Molecule) -> f64 {
+    compute_tpsa_inner(mol, true)
+}
+
+/// Ertl (2000) TPSA counting N and O only (RDKit default & Bickerton QED convention).
+pub fn compute_tpsa_no_only(mol: &Molecule) -> f64 {
+    compute_tpsa_inner(mol, false)
+}
+
+fn compute_tpsa_inner(mol: &Molecule, include_s_and_p: bool) -> f64 {
     let mut tpsa = 0.0;
     for (idx, atom) in mol.atoms.iter().enumerate() {
         let z = atom.atomic_number;
-        if !matches!(z, 7 | 8 | 15 | 16) {
+        if !matches!(z, 7 | 8) && !(include_s_and_p && matches!(z, 15 | 16)) {
             continue;
         }
         let h = atom.total_h();
@@ -206,7 +293,10 @@ pub fn compute_tpsa_ertl(mol: &Molecule) -> f64 {
         let mut double_b = 0usize;
         let mut triple_b = 0usize;
         let mut arom_b = 0usize;
-        for &(_, bid) in &mol.adj[idx] {
+        for &(nbr, bid) in &mol.adj[idx] {
+            if mol.atoms[nbr].atomic_number == 1 {
+                continue;
+            }
             match mol.bonds[bid].order {
                 BondOrder::Single => single_b += 1,
                 BondOrder::Double => double_b += 1,
@@ -303,11 +393,16 @@ fn ertl_n(
         if double_b == 1 && h == 2 {
             return 25.59;
         }
-        if double_b == 2 {
-            return 2.79;
-        }
+        // Ertl (2000) linear fallback for unlisted charged N (e.g. azide =[N+]= -> 14.10)
+        let heavy_deg = single_b + double_b + triple_b + arom_b;
+        return (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * f64::from(h)).max(0.0);
+    } else if charge < 0 {
+        // Ertl (2000) linear fallback for formally negative N (e.g. azide =[N-] -> 22.30)
+        let heavy_deg = single_b + double_b + triple_b + arom_b;
+        return (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * f64::from(h)).max(0.0);
     }
-    12.03
+    let heavy_deg = single_b + double_b + triple_b + arom_b;
+    (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * f64::from(h)).max(0.0)
 }
 
 fn ertl_o(
@@ -377,6 +472,14 @@ fn ertl_p(single_b: usize, double_b: usize, h: u8) -> f64 {
     13.59
 }
 
+pub fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
 pub fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+pub fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
 }

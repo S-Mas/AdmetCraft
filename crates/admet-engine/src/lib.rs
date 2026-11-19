@@ -120,8 +120,20 @@ pub struct FilterCriteria {
     pub max_lipinski_violations: Option<usize>,
     pub require_bbb: Option<bool>,
     pub require_gi_high: Option<bool>,
+    #[serde(default)]
     pub no_pains: bool,
+    #[serde(default)]
     pub no_brenk: bool,
+    #[serde(default)]
+    pub min_qed: Option<f64>,
+    #[serde(default)]
+    pub min_cns_mpo: Option<f64>,
+    #[serde(default)]
+    pub no_high_herg: bool,
+    #[serde(default)]
+    pub no_ames: bool,
+    #[serde(default)]
+    pub no_dili: bool,
 }
 
 impl FilterCriteria {
@@ -147,6 +159,25 @@ impl FilterCriteria {
             return false;
         }
         if self.no_brenk && !eval.medicinal_chemistry.brenk_alerts.is_empty() {
+            return false;
+        }
+        if let Some(min_qed) = self.min_qed
+            && eval.druglikeness.qed < min_qed
+        {
+            return false;
+        }
+        if let Some(min_mpo) = self.min_cns_mpo
+            && eval.druglikeness.cns_mpo < min_mpo
+        {
+            return false;
+        }
+        if self.no_high_herg && eval.safety.herg_risk == admet_calc::HergRisk::High {
+            return false;
+        }
+        if self.no_ames && !eval.safety.ames_alerts.is_empty() {
+            return false;
+        }
+        if self.no_dili && !eval.safety.dili_alerts.is_empty() {
             return false;
         }
         true
@@ -212,6 +243,18 @@ impl CommandRegistry {
             CommandDescriptor {
                 id: "filter_bbb_yes",
                 title: "Filter: BBB Permeant (Yolk Only)",
+                shortcut: "",
+                category: "Filter",
+            },
+            CommandDescriptor {
+                id: "filter_qed_05",
+                title: "Filter: Drug-like QED >= 0.50 & No PAINS",
+                shortcut: "",
+                category: "Filter",
+            },
+            CommandDescriptor {
+                id: "filter_cns_mpo_4",
+                title: "Filter: CNS MPO >= 4.0 & BBB+",
                 shortcut: "",
                 category: "Filter",
             },
@@ -475,6 +518,7 @@ mod tests {
                     require_gi_high: Some(true),
                     no_pains: true,
                     no_brenk: false,
+                    ..FilterCriteria::default()
                 },
             },
         )?;

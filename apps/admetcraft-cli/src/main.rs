@@ -4,7 +4,7 @@ mod mcp;
 
 use std::path::PathBuf;
 
-use admet_calc::{evaluate_batch, evaluate_smiles};
+use admet_calc::{MoleculeEvaluation, compare_smiles, evaluate_batch, evaluate_smiles};
 use admet_engine::{MAX_READ_BYTES, PathSandbox};
 use admet_report::{ExportFormat, write_report_file, write_report_to_writer};
 use chem_core::{parse_csv_batch, parse_sdf, parse_smiles_batch};
@@ -31,6 +31,27 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Print a concise human-readable ADMET & safety profile card for a SMILES string.
+    Profile {
+        /// SMILES string (or "SMILES Name").
+        smiles: String,
+        /// Optional molecule name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Compare two molecules side-by-side (MMP / lead optimization delta JSON).
+    Compare {
+        /// Reference molecule SMILES (or "SMILES Name").
+        smiles_a: String,
+        /// Candidate analog SMILES (or "SMILES Name").
+        smiles_b: String,
+        /// Optional name for molecule A.
+        #[arg(long)]
+        name_a: Option<String>,
+        /// Optional name for molecule B.
+        #[arg(long)]
+        name_b: Option<String>,
+    },
     /// Process a batch file (.smi, .csv, .sdf) in parallel across all CPU cores.
     Batch {
         /// Input file (.smi, .csv, .sdf).
@@ -47,6 +68,9 @@ enum Commands {
         /// Optional write sandbox root.
         #[arg(long)]
         write_root: Option<PathBuf>,
+        /// Explicitly allow creating a non-existent --write-root directory hierarchy.
+        #[arg(long)]
+        create_write_root: bool,
     },
     /// Start the Model Context Protocol (MCP) server on stdio or TCP.
     Mcp {
@@ -56,6 +80,9 @@ enum Commands {
         /// Authorized directory for writing output reports.
         #[arg(long)]
         write_root: PathBuf,
+        /// Explicitly allow creating a non-existent --write-root directory hierarchy.
+        #[arg(long)]
+        create_write_root: bool,
         /// Optional TCP bridge address (loopback by default; requires --mcp-token).
         #[arg(long)]
         tcp: Option<String>,
@@ -87,16 +114,40 @@ impl From<CliFormat> for ExportFormat {
     }
 }
 
+fn split_smiles_and_name<'a>(
+    raw: &'a str,
+    explicit: Option<&'a str>,
+) -> (&'a str, Option<&'a str>) {
+    let mut parts = raw.trim().splitn(2, char::is_whitespace);
+    let smi_token = parts.next().unwrap_or("");
+    let inline_name = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    (smi_token, explicit.or(inline_name))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Eval { smiles, name } => {
-            let mut parts = smiles.trim().splitn(2, char::is_whitespace);
-            let smi_token = parts.next().unwrap_or("");
-            let inline_name = parts.next().map(str::trim).filter(|s| !s.is_empty());
-            let final_name = name.as_deref().or(inline_name);
+            let (smi_token, final_name) = split_smiles_and_name(&smiles, name.as_deref());
             let eval = evaluate_smiles(smi_token, final_name)?;
             let out = serde_json::to_string_pretty(&eval)?;
+            println!("{out}");
+        }
+        Commands::Profile { smiles, name } => {
+            let (smi_token, final_name) = split_smiles_and_name(&smiles, name.as_deref());
+            let eval = evaluate_smiles(smi_token, final_name)?;
+            print_profile(&eval);
+        }
+        Commands::Compare {
+            smiles_a,
+            smiles_b,
+            name_a,
+            name_b,
+        } => {
+            let (smi_a, final_a) = split_smiles_and_name(&smiles_a, name_a.as_deref());
+            let (smi_b, final_b) = split_smiles_and_name(&smiles_b, name_b.as_deref());
+            let cmp = compare_smiles(smi_a, final_a, smi_b, final_b)?;
+            let out = serde_json::to_string_pretty(&cmp)?;
             println!("{out}");
         }
         Commands::Batch {
@@ -105,9 +156,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             format,
             read_root,
             write_root,
+            create_write_root,
         } => {
+            if read_root.is_none() || write_root.is_none() {
+                eprintln!(
+                    "Notice: running batch without full --read-root/--write-root sandbox (direct local filesystem access)."
+                );
+            }
             let (ext, content) = if let Some(rr) = read_root.as_deref() {
-                let sb = PathSandbox::new(Some(rr), None)?;
+                let sb = PathSandbox::new_with_options(Some(rr), None, false)?;
                 let (resolved_in, text) = sb.read_to_string_limited(&input, MAX_READ_BYTES)?;
                 let ext = resolved_in
                     .extension()
@@ -125,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let evals = load_molecules_from_text(&ext, &content)?;
             if let Some(wr) = write_root.as_deref() {
-                let sb = PathSandbox::new(None, Some(wr))?;
+                let sb = PathSandbox::new_with_options(None, Some(wr), create_write_root)?;
                 let (resolved_out, mut file) = sb.open_write(&out)?;
                 write_report_to_writer(&evals, &mut file, format.into())?;
                 eprintln!(
@@ -141,11 +198,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Mcp {
             read_root,
             write_root,
+            create_write_root,
             tcp,
             allow_remote,
             mcp_token,
         } => {
-            let sandbox = PathSandbox::new(Some(&read_root), Some(&write_root))?;
+            let sandbox = PathSandbox::new_with_options(
+                Some(&read_root),
+                Some(&write_root),
+                create_write_root,
+            )?;
             if let Some(addr) = tcp {
                 let token = mcp_token.or_else(|| std::env::var("ADMETCRAFT_MCP_TOKEN").ok());
                 mcp::run_mcp_tcp(&addr, &sandbox, allow_remote, token)?;
@@ -155,6 +217,132 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b { "Yes" } else { "No" }
+}
+
+fn print_profile(e: &MoleculeEvaluation) {
+    let p = &e.physicochemical;
+    let l = &e.lipophilicity;
+    let ion = &e.ionization;
+    let w = &e.water_solubility;
+    let pk = &e.pharmacokinetics;
+    let d = &e.druglikeness;
+    let mc = &e.medicinal_chemistry;
+    let s = &e.safety;
+
+    println!("=== {} ({}) ===", e.name, p.formula);
+    println!("SMILES        : {}", e.canonical_smiles);
+    println!(
+        "Physicochem   : MW={:.2} Da | Exact={:.4} Da | HA={} (Ar={}) | Rings={} (Ar={}) | DBE={:.1}",
+        p.molecular_weight,
+        p.exact_mass,
+        p.heavy_atoms,
+        p.aromatic_heavy_atoms,
+        p.num_rings,
+        p.num_aromatic_rings,
+        p.dbe
+    );
+    println!(
+        "Polarity/Flex : TPSA={:.2} A^2 (N/O={:.2}) | HBA={} | HBD={} | RotB={} | Fsp3={:.2} | MR={:.2}",
+        p.tpsa,
+        p.tpsa_no_only,
+        p.h_bond_acceptors,
+        p.h_bond_donors,
+        p.rotatable_bonds,
+        p.fraction_csp3,
+        p.molar_refractivity
+    );
+    println!(
+        "Lipophilicity : WLOGP={:.2} | XLOGP3={:.2} | MLOGP={:.2} | Consensus={:.2}",
+        l.wlogp, l.xlogp3, l.mlogp, l.consensus_log_p
+    );
+    let pka_a = ion
+        .strongest_acidic_pka
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "-".to_string());
+    let pka_b = ion
+        .strongest_basic_pka
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "Ionization    : {} | LogD7.4={:.2} | Charge@7.4={:+.2} | pKa(a)={} pKa(b)={}",
+        ion.ionization_class.as_str(),
+        ion.logd_ph74,
+        ion.estimated_charge_ph74,
+        pka_a,
+        pka_b
+    );
+    println!(
+        "Solubility    : ESOL={:.2} ({}) | Ali={:.2} ({})",
+        w.esol.log_s,
+        w.esol.class.as_str(),
+        w.ali.log_s,
+        w.ali.class.as_str()
+    );
+    println!(
+        "PK/BOILED-Egg : GI={} | BBB={} | LogKp={:.2} cm/s | P-gp(exp)={} | CYP(exp) 1A2:{} 2C19:{} 2C9:{} 2D6:{} 3A4:{}",
+        pk.gi_absorption.as_str(),
+        yes_no(pk.bbb_permeant),
+        pk.log_kp_cm_s,
+        yes_no(pk.pgp_substrate),
+        yes_no(pk.cyp1a2_inhibitor),
+        yes_no(pk.cyp2c19_inhibitor),
+        yes_no(pk.cyp2c9_inhibitor),
+        yes_no(pk.cyp2d6_inhibitor),
+        yes_no(pk.cyp3a4_inhibitor)
+    );
+    println!(
+        "Druglikeness  : QED={:.3} | CNS_MPO={:.2}/6.0 | Bioavail={:.2} | Lipinski={}({}) | Veber={} | Ghose={} | Egan={} | Muegge={}",
+        d.qed,
+        d.cns_mpo,
+        d.bioavailability_score,
+        yes_no(d.lipinski.pass),
+        d.lipinski.violations,
+        yes_no(d.veber.pass),
+        yes_no(d.ghose.pass),
+        yes_no(d.egan.pass),
+        yes_no(d.muegge.pass)
+    );
+    println!(
+        "MedChem Rules : Pfizer3/75={} | GSK4/400={} | GoldenTri={} | Ro3={} | bRo5={} | Leadlike={} | SA(proxy)={:.2}",
+        yes_no(d.pfizer_3_75.pass),
+        yes_no(d.gsk_4_400.pass),
+        yes_no(d.golden_triangle.pass),
+        yes_no(d.ro3_fragment.pass),
+        yes_no(d.beyond_ro5),
+        yes_no(mc.leadlikeness.pass),
+        mc.synthetic_accessibility
+    );
+    let fmt_alerts = |xs: &[String]| -> String {
+        if xs.is_empty() {
+            "none".to_string()
+        } else {
+            xs.join(", ")
+        }
+    };
+    println!(
+        "Alerts/Safety : PAINS({}/{})=[{}] | Brenk({}/{})=[{}]",
+        mc.pains_alerts.len(),
+        mc.pains_catalog_size,
+        fmt_alerts(&mc.pains_alerts),
+        mc.brenk_alerts.len(),
+        mc.brenk_catalog_size,
+        fmt_alerts(&mc.brenk_alerts)
+    );
+    println!(
+        "Toxicity(exp) : hERG={} | AMES({})=[{}] | DILI({})=[{}]",
+        s.herg_risk.as_str(),
+        s.ames_alerts.len(),
+        fmt_alerts(&s.ames_alerts),
+        s.dili_alerts.len(),
+        fmt_alerts(&s.dili_alerts)
+    );
+    for w_msg in &e.warnings {
+        println!("Warning       : {w_msg}");
+    }
 }
 
 fn load_molecules_from_text(
@@ -230,6 +418,94 @@ mod tests {
         assert_eq!(lines[3]["result"]["isError"], true);
         assert_eq!(lines[4]["result"]["isError"], false);
         assert!(wdir.join("report.csv").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_strict_jsonrpc20_compliance_and_compare_tool() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let base = std::env::temp_dir().join("admetcraft_mcp_jsonrpc20_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let rdir = base.join("read");
+        let wdir = base.join("write");
+        std::fs::create_dir_all(&rdir)?;
+        std::fs::create_dir_all(&wdir)?;
+        let sb = PathSandbox::new_with_options(Some(&rdir), Some(&wdir), false)?;
+
+        // Missing write_root must be rejected when create_write_root is false
+        assert!(
+            PathSandbox::new_with_options(Some(&rdir), Some(&base.join("nonexistent_dir")), false)
+                .is_err()
+        );
+
+        let requests = [
+            // 1. Missing jsonrpc -> -32600
+            serde_json::json!({"id":1,"method":"ping"}).to_string(),
+            // 2. Wrong jsonrpc "1.0" -> -32600
+            serde_json::json!({"jsonrpc":"1.0","id":2,"method":"ping"}).to_string(),
+            // 3. Explicit id: null -> MUST reply with id: null
+            serde_json::json!({"jsonrpc":"2.0","id":null,"method":"ping"}).to_string(),
+            // 4. Initialize
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}).to_string(),
+            // 5. Notification (no 'id' member) -> MUST produce NO output
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+            // 6. tools/list -> all 5 tools must expose outputSchema
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}).to_string(),
+            // 7. Negative max_lipinski_violations -> -32602 Invalid params
+            serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"filter_druglikeness","arguments":{"smiles":["CCO"],"max_lipinski_violations":-1}}}).to_string(),
+            // 8. export_report missing required 'format' -> -32602 (no silent fallback to csv)
+            serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"export_report","arguments":{"smiles":["CCO"],"output_path":"x.csv"}}}).to_string(),
+            // 9. export_report unsupported 'format' -> -32602
+            serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"export_report","arguments":{"smiles":["CCO"],"output_path":"x.xml","format":"xml"}}}).to_string(),
+            // 10. compare_molecules tool
+            serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"compare_molecules","arguments":{"smiles_a":"CC(C)Cc1ccc(C(C)C(=O)O)cc1","smiles_b":"CC(C)Cc1ccc(C(C)c2nnn[nH]2)cc1","name_a":"Ibuprofen","name_b":"Ibu_Tetrazole"}}}).to_string(),
+        ].join("\n") + "\n";
+
+        let mut out_buf = Vec::new();
+        mcp::serve_stream_for_test(BufReader::new(requests.as_bytes()), &mut out_buf, &sb, None)?;
+        let out_str = String::from_utf8(out_buf)?;
+        let lines: Vec<serde_json::Value> = out_str
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+
+        // 10 inputs minus 1 notification = 9 responses
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[0]["error"]["code"], -32600);
+        assert_eq!(lines[1]["error"]["code"], -32600);
+        assert!(lines[2]["id"].is_null());
+        assert_eq!(lines[2]["result"], serde_json::json!({}));
+        assert_eq!(lines[3]["id"], 3);
+
+        let tools = lines[4]["result"]["tools"]
+            .as_array()
+            .ok_or("tools must be array")?;
+        assert_eq!(tools.len(), 5);
+        for t in tools {
+            assert!(
+                t.get("outputSchema").is_some(),
+                "tool {} missing outputSchema",
+                t["name"]
+            );
+        }
+
+        assert_eq!(lines[5]["error"]["code"], -32602);
+        assert_eq!(lines[6]["error"]["code"], -32602);
+        assert_eq!(lines[7]["error"]["code"], -32602);
+        assert_eq!(lines[8]["result"]["isError"], false);
+        assert_eq!(
+            lines[8]["result"]["structuredContent"]["name_a"],
+            "Ibuprofen"
+        );
+        assert!(
+            lines[8]["result"]["structuredContent"]["delta_tpsa"]
+                .as_f64()
+                .unwrap_or(0.0)
+                > 15.0
+        );
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

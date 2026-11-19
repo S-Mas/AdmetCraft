@@ -1,5 +1,6 @@
 use std::f64::consts::PI;
 use std::fmt::Write as _;
+use std::io::Write as _;
 
 use admet_calc::pharmacokinetics::{
     BOILED_EGG_WHITE_ANGLE_RAD, BOILED_EGG_WHITE_AXES, BOILED_EGG_WHITE_CENTER,
@@ -7,6 +8,8 @@ use admet_calc::pharmacokinetics::{
 };
 use admet_calc::{BioavailabilityRadar, BoiledEggGeometry, MoleculeEvaluation};
 use chem_core::{BondOrder, ensure_2d_coords, parse_smiles};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 
 use crate::ReportError;
 
@@ -497,6 +500,8 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
     let pk = &eval.pharmacokinetics;
     let d = &eval.druglikeness;
     let mc = &eval.medicinal_chemistry;
+    let ion = &eval.ionization;
+    let sf = &eval.safety;
 
     let mut y_left = PAGE_H - 275.0;
     y_left = draw_kv_section(
@@ -538,6 +543,10 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
             ),
             ("Topo est. (exp.)", format!("{:.2}", l.topological_logp_est)),
             ("Consensus (3-model)", format!("{:.2}", l.consensus_log_p)),
+            (
+                "LogD 7.4 / State",
+                format!("{:.2} ({})", ion.logd_ph74, ion.ionization_class.as_str()),
+            ),
         ],
     );
     y_left -= 12.0;
@@ -636,6 +645,27 @@ fn build_molecule_page(eval: &MoleculeEvaluation) -> String {
             (
                 "Bioavailability Score",
                 format!("{:.2}", d.bioavailability_score),
+            ),
+            (
+                "QED / CNS MPO",
+                format!("{:.3}  /  {:.2} / 6", d.qed, d.cns_mpo),
+            ),
+            (
+                "Pfizer 3/75 / GSK 4/400",
+                format!(
+                    "{} / {}",
+                    yes_no(d.pfizer_3_75.pass),
+                    yes_no(d.gsk_4_400.pass)
+                ),
+            ),
+            (
+                "hERG / AMES / DILI",
+                format!(
+                    "{} / {} / {}",
+                    sf.herg_risk.as_str(),
+                    sf.ames_alerts.len(),
+                    sf.dili_alerts.len()
+                ),
             ),
         ],
     );
@@ -1109,12 +1139,30 @@ fn assemble_pdf(page_streams: &[String]) -> Vec<u8> {
         );
         push_obj(&mut out, &mut offsets, page_id, page_body.as_bytes());
 
-        let content_bytes = stream.as_bytes();
-        let mut stream_body =
-            format!("<< /Length {} >>\nstream\n", content_bytes.len()).into_bytes();
-        stream_body.extend_from_slice(content_bytes);
-        stream_body.extend_from_slice(b"\nendstream");
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        let compressed = if enc.write_all(stream.as_bytes()).is_ok() {
+            enc.finish().ok()
+        } else {
+            None
+        };
+        let mut stream_body = if let Some(zbytes) = compressed {
+            let mut sb = format!(
+                "<< /Filter /FlateDecode /Length {} >>\nstream\n",
+                zbytes.len()
+            )
+            .into_bytes();
+            sb.extend_from_slice(&zbytes);
+            sb.extend_from_slice(b"\nendstream");
+            sb
+        } else {
+            let content_bytes = stream.as_bytes();
+            let mut sb = format!("<< /Length {} >>\nstream\n", content_bytes.len()).into_bytes();
+            sb.extend_from_slice(content_bytes);
+            sb.extend_from_slice(b"\nendstream");
+            sb
+        };
         push_obj(&mut out, &mut offsets, content_id, &stream_body);
+        stream_body.clear();
     }
 
     let xref_offset = out.len();
