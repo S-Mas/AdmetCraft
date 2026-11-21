@@ -40,6 +40,12 @@ pub fn default_model_pack_path() -> PathBuf {
     admet_models_dir().join("admetcraft_tdc_v1.json")
 }
 
+/// Optional user-enriched SEA off-target index JSON (`.../models/admetcraft_v1/sea_offtargets.json`).
+#[must_use]
+pub fn default_sea_index_path() -> PathBuf {
+    admet_models_dir().join("sea_offtargets.json")
+}
+
 /// Directory storing raw downloaded TDC `.tab` datasets (`.../models/tdc_raw`).
 #[must_use]
 pub fn tdc_raw_dir() -> PathBuf {

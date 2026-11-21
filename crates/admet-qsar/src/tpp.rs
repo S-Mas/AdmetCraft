@@ -352,6 +352,72 @@ pub fn compute_tpp_mpo(eval: &MoleculeEvaluation, preset: TppPreset) -> TppMpoRe
         ));
     }
 
+    // 11. Tox21 Cellular Safety (12 pathways: 7 Nuclear Receptors + 5 Stress Responses)
+    if let Some(tox21) = &eval.tox21_summary {
+        let total_alerts = tox21.endocrine_alerts.len() + tox21.stress_alerts.len();
+        let d_tox21 = 0.60 * ramp_low_better(total_alerts as f64, 0.0, 3.0)
+            + 0.40 * ramp_low_better(tox21.max_probability, 0.35, 0.80);
+        push_crit(
+            &mut criteria,
+            "Tox21 Cellular & Endocrine Pathways",
+            format!(
+                "{} alert(s) (NR={}, SR={}, max P={:.2})",
+                total_alerts,
+                tox21.endocrine_alerts.len(),
+                tox21.stress_alerts.len(),
+                tox21.max_probability
+            ),
+            "0 Tox21 alerts & max P < 0.35",
+            d_tox21,
+            1.2,
+        );
+        if total_alerts >= 3 || (tox21.stress_alerts.len() >= 2 && tox21.max_probability >= 0.75) {
+            hard_stops.push(format!(
+                "Multiple Tox21 cellular/endocrine pathway alerts ({total_alerts} flagged, max P={:.2})",
+                tox21.max_probability
+            ));
+        }
+    }
+
+    // 12. Off-Target Safety Pharmacology (SEA) & Phase I/II Metabolite Bioactivation Guard
+    if eval.off_targets.is_some() || eval.metabolite_guard.is_some() {
+        let sea_high = eval.off_targets.as_ref().map_or(0, |o| o.high_risk_count);
+        let sea_mod = eval
+            .off_targets
+            .as_ref()
+            .map_or(0, |o| o.moderate_risk_count);
+        let met_bio = eval
+            .metabolite_guard
+            .as_ref()
+            .map_or(0, |m| m.bioactivation_alerts);
+        let met_esc = eval
+            .metabolite_guard
+            .as_ref()
+            .map_or(0, |m| m.escalation_count);
+
+        let d_sea = ramp_low_better((sea_high as f64) + 0.35 * (sea_mod as f64), 0.0, 2.5);
+        let d_met = ramp_low_better((met_bio as f64) + 0.40 * (met_esc as f64), 0.0, 2.5);
+        let d_guard = 0.50 * d_sea + 0.50 * d_met;
+        push_crit(
+            &mut criteria,
+            "Off-Target SEA & Metabolite Guard",
+            format!("SEA High={sea_high}/Mod={sea_mod} | Bioact={met_bio}/Esc={met_esc}"),
+            "0 SEA High & 0 reactive bioactivation",
+            d_guard,
+            1.3,
+        );
+        if met_bio >= 2 {
+            hard_stops.push(format!(
+                "Multiple reactive metabolite bioactivation pathways ({met_bio})"
+            ));
+        }
+        if sea_high >= 2 {
+            hard_stops.push(format!(
+                "Promiscuous Bowes Safety-20 off-target profile ({sea_high} High-risk targets)"
+            ));
+        }
+    }
+
     let w_sum: f64 = criteria.iter().map(|c| c.weight).sum();
     let raw_score = if w_sum > 0.0 {
         criteria

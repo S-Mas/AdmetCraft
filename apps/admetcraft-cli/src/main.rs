@@ -7,12 +7,14 @@ use std::path::PathBuf;
 use admet_calc::{MoleculeEvaluation, QsarTaskKind, TppPreset};
 use admet_engine::{MAX_READ_BYTES, PathSandbox};
 use admet_qsar::{
-    AdmetModelPack, GbdtTrainConfig, compare_smiles_auto, default_model_pack_path,
-    evaluate_batch_auto, evaluate_smiles_auto, load_default_model_pack, tdc_raw_dir,
+    AdmetModelPack, DEFAULT_MAX_METABOLITES, EvalOptions, GbdtTrainConfig, SeaOffTargetIndex,
+    build_sea_index_from_tsv, compare_smiles_auto, default_model_pack_path, default_sea_index_path,
+    evaluate_batch_auto_with_options, evaluate_smiles_auto, load_default_model_pack,
+    load_default_sea_index, predict_metabolism_sites, run_metabolite_guard, tdc_raw_dir,
     train_tdc_model_pack,
 };
 use admet_report::{ExportFormat, write_report_file, write_report_to_writer};
-use chem_core::{parse_csv_batch, parse_sdf, parse_smiles_batch};
+use chem_core::{parse_csv_batch, parse_sdf, parse_smiles, parse_smiles_batch};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -99,6 +101,9 @@ enum Commands {
         /// Target Product Profile preset for TPP MPO scoring.
         #[arg(long, value_enum, default_value = "oral")]
         tpp: CliTpp,
+        /// Skip Phase I/II metabolite re-screening for ultra-fast >10k compound screening.
+        #[arg(long)]
+        fast: bool,
         /// Optional read sandbox root.
         #[arg(long)]
         read_root: Option<PathBuf>,
@@ -126,6 +131,43 @@ enum Commands {
         /// Maximum tree depth.
         #[arg(long, default_value_t = 5)]
         max_depth: usize,
+    },
+    /// Predict Phase I & Phase II hepatic/plasma metabolites and re-screen each for reactive bioactivation & toxicity escalation.
+    Metabolites {
+        /// SMILES string (or "SMILES Name").
+        smiles: String,
+        /// Optional molecule name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Maximum distinct metabolites to generate and re-screen.
+        #[arg(long, default_value_t = DEFAULT_MAX_METABOLITES)]
+        max_metabolites: usize,
+        /// Emit full JSON instead of formatted summary table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run local pure-Rust SEA (Similarity Ensemble Approach) off-target safety pharmacology fishing.
+    Offtargets {
+        /// SMILES string (or "SMILES Name").
+        smiles: String,
+        /// Optional molecule name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional custom SEA off-target index JSON (defaults to CRAFT_DATA_DIR or embedded Safety-20).
+        #[arg(long)]
+        sea_index: Option<PathBuf>,
+        /// Emit full JSON instead of formatted summary table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build a custom local SEA off-target index JSON from a TSV (`target_id\ttarget_name\ttarget_class\torgan_liability\tligand_name\tsmiles`).
+    BuildSeaIndex {
+        /// Input TSV path containing reference active ligands per target.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output JSON path (defaults to CRAFT_DATA_DIR/models/admetcraft_v1/sea_offtargets.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Display held-out Bemis-Murcko scaffold validation metrics for the installed local QSAR model pack.
     ModelInfo {
@@ -217,6 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             out,
             format,
             tpp,
+            fast,
             read_root,
             write_root,
             create_write_root,
@@ -243,7 +286,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .to_ascii_lowercase();
                 (ext, std::fs::read_to_string(&input)?)
             };
-            let evals = load_molecules_from_text(&ext, &content, tpp.into())?;
+            let opts = EvalOptions {
+                run_offtargets: true,
+                run_metabolites: !fast,
+                max_metabolites: DEFAULT_MAX_METABOLITES,
+            };
+            let evals = load_molecules_from_text(&ext, &content, tpp.into(), opts)?;
             if let Some(wr) = write_root.as_deref() {
                 let sb = PathSandbox::new_with_options(None, Some(wr), create_write_root)?;
                 let (resolved_out, mut file) = sb.open_write(&out)?;
@@ -277,6 +325,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!(
                 "Saved {} trained QSAR endpoint(s) -> {}",
                 pack.models.len(),
+                dst.display()
+            );
+        }
+        Commands::Metabolites {
+            smiles,
+            name,
+            max_metabolites,
+            json,
+        } => {
+            let (smi_token, final_name) = split_smiles_and_name(&smiles, name.as_deref());
+            let mut mol = parse_smiles(smi_token)?;
+            if let Some(n) = final_name {
+                mol.name = Some(n.to_string());
+            }
+            let pack = load_default_model_pack();
+            let mut parent_eval = admet_calc::evaluate_molecule(&mol);
+            if let Some(mp) = pack {
+                let feat = admet_qsar::extract_mol_features(&mol, &parent_eval);
+                parent_eval.qsar = Some(mp.predict_all(&feat, "local"));
+            }
+            let sites = predict_metabolism_sites(&mol);
+            let report = run_metabolite_guard(&mol, &parent_eval, &sites, pack, max_metabolites);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "=== Metabolite Guard: {} ({} generated | {} bioactivation | {} escalation) ===",
+                    parent_eval.name,
+                    report.total_generated,
+                    report.bioactivation_alerts,
+                    report.escalation_count
+                );
+                for m in &report.metabolites {
+                    let flag = if m.reactive_bioactivation {
+                        "BIOACTIVATION"
+                    } else if m.toxicity_escalation {
+                        "ESCALATION"
+                    } else {
+                        "OK"
+                    };
+                    println!(
+                        "  #{:<2} [{}] {:8} {:42} | DILI={} AMES={} | {}",
+                        m.rank,
+                        flag,
+                        m.phase.as_str(),
+                        m.reaction,
+                        m.dili_prob
+                            .map_or_else(|| "-".to_string(), |v| format!("{v:.2}")),
+                        m.ames_prob
+                            .map_or_else(|| "-".to_string(), |v| format!("{v:.2}")),
+                        m.smiles
+                    );
+                    if let Some(reason) = &m.bioactivation_reason {
+                        println!("      -> {reason}");
+                    }
+                }
+            }
+        }
+        Commands::Offtargets {
+            smiles,
+            name,
+            sea_index,
+            json,
+        } => {
+            let (smi_token, final_name) = split_smiles_and_name(&smiles, name.as_deref());
+            let mut mol = parse_smiles(smi_token)?;
+            if let Some(n) = final_name {
+                mol.name = Some(n.to_string());
+            }
+            let report = if let Some(path) = sea_index {
+                let idx = SeaOffTargetIndex::load_from_path(&path)?;
+                idx.predict_molecule(&mol)
+            } else {
+                load_default_sea_index().predict_molecule(&mol)
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "=== SEA Off-Target Profile: {} ({} | {} targets | {} High, {} Moderate) ===",
+                    mol.name.as_deref().unwrap_or("Query"),
+                    report.panel_version,
+                    report.targets_evaluated,
+                    report.high_risk_count,
+                    report.moderate_risk_count
+                );
+                if report.hits.is_empty() {
+                    println!("  No significant off-target hits (all Low risk).");
+                } else {
+                    for h in &report.hits {
+                        println!(
+                            "  {:14} [{:8}] maxTc={:.3} Z={:+6.2} E={:.2e} | nearest={:16} | {}",
+                            h.target_id,
+                            h.risk.as_str(),
+                            h.max_tanimoto,
+                            h.z_score,
+                            h.e_value,
+                            h.nearest_ligand,
+                            h.organ_liability
+                        );
+                    }
+                }
+            }
+        }
+        Commands::BuildSeaIndex { input, out } => {
+            let dst = out.unwrap_or_else(default_sea_index_path);
+            let idx = build_sea_index_from_tsv(&input, &dst)?;
+            let total_ligs: usize = idx.targets.iter().map(|t| t.ligands.len()).sum();
+            println!(
+                "Built SEA index ({} targets, {} ligands) -> {}",
+                idx.targets.len(),
+                total_ligs,
                 dst.display()
             );
         }
@@ -502,6 +662,63 @@ fn print_profile(e: &MoleculeEvaluation) {
             );
         }
     }
+    if let Some(tox21) = &e.tox21_summary {
+        let tot = tox21.endocrine_alerts.len() + tox21.stress_alerts.len();
+        println!(
+            "Tox21 Panel   : {} assays | {} alert(s) (NR={}, SR={}, max P={:.2})",
+            tox21.assays_evaluated,
+            tot,
+            tox21.endocrine_alerts.len(),
+            tox21.stress_alerts.len(),
+            tox21.max_probability
+        );
+        for a in &tox21.endocrine_alerts {
+            println!("  NR ALERT    : {a}");
+        }
+        for a in &tox21.stress_alerts {
+            println!("  SR ALERT    : {a}");
+        }
+    }
+    if let Some(sea) = &e.off_targets {
+        println!(
+            "SEA OffTarget : {} ({} targets | {} High, {} Moderate)",
+            sea.panel_version, sea.targets_evaluated, sea.high_risk_count, sea.moderate_risk_count
+        );
+        for h in sea.hits.iter().take(5) {
+            println!(
+                "  {:14} [{:8}] maxTc={:.3} Z={:+5.2} ({}) -> {}",
+                h.target_id,
+                h.risk.as_str(),
+                h.max_tanimoto,
+                h.z_score,
+                h.nearest_ligand,
+                h.organ_liability
+            );
+        }
+    }
+    if let Some(mg) = &e.metabolite_guard {
+        println!(
+            "Metab. Guard  : {} generated | {} bioactivation | {} escalation",
+            mg.total_generated, mg.bioactivation_alerts, mg.escalation_count
+        );
+        for m in mg.metabolites.iter().take(5) {
+            let tag = if m.reactive_bioactivation {
+                "BIOACT"
+            } else if m.toxicity_escalation {
+                "ESC"
+            } else {
+                "OK"
+            };
+            println!(
+                "  #{:<2} [{:6}] {:7} {:40} | {}",
+                m.rank,
+                tag,
+                m.phase.as_str(),
+                m.reaction,
+                m.smiles
+            );
+        }
+    }
     for w_msg in &e.warnings {
         println!("Warning       : {w_msg}");
     }
@@ -511,6 +728,7 @@ fn load_molecules_from_text(
     ext: &str,
     content: &str,
     tpp: TppPreset,
+    opts: EvalOptions,
 ) -> Result<Vec<admet_calc::MoleculeEvaluation>, Box<dyn std::error::Error>> {
     let mut mols = Vec::new();
     if ext == "sdf" || ext == "mol" {
@@ -535,7 +753,7 @@ fn load_molecules_from_text(
             }
         }
     }
-    Ok(evaluate_batch_auto(&mols, tpp))
+    Ok(evaluate_batch_auto_with_options(&mols, tpp, opts))
 }
 
 #[cfg(test)]
@@ -646,7 +864,7 @@ mod tests {
         let tools = lines[4]["result"]["tools"]
             .as_array()
             .ok_or("tools must be array")?;
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         for t in tools {
             assert!(
                 t.get("outputSchema").is_some(),
@@ -797,6 +1015,48 @@ mod tests {
         .ok_or("missing serialized panic response")?;
         let isolated_v: serde_json::Value = serde_json::from_str(&isolated)?;
         assert_eq!(isolated_v["error"]["code"], -32603);
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_predict_metabolites_and_offtargets_tools_work() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let base = std::env::temp_dir().join("admetcraft_mcp_ola1_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+        let sb = PathSandbox::new(Some(&base), Some(&base))?;
+
+        let requests = [
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"predict_metabolites","arguments":{"smiles":"CC(=O)Nc1ccc(O)cc1","name":"Paracetamol"}}}).to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"predict_offtargets","arguments":{"smiles":"O=C(CCCN1CCC(O)(c2ccc(Cl)cc2)CC1)c1ccc(F)cc1","name":"Haloperidol"}}}).to_string(),
+        ].join("\n") + "\n";
+
+        let mut out_buf = Vec::new();
+        mcp::serve_stream_for_test(BufReader::new(requests.as_bytes()), &mut out_buf, &sb, None)?;
+        let out_str = String::from_utf8(out_buf)?;
+        let lines: Vec<serde_json::Value> = out_str
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1]["result"]["isError"], false);
+        assert!(
+            lines[1]["result"]["structuredContent"]["bioactivation_alerts"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(lines[2]["result"]["isError"], false);
+        assert!(
+            lines[2]["result"]["structuredContent"]["high_risk_count"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

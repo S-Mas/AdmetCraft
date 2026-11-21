@@ -104,6 +104,11 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
         "QSAR AqSolDB LogS",
         "QSAR LogD7.4 (AZ)",
         "Top Site of Metabolism",
+        "Tox21 Alerts",
+        "SEA Off-Target High",
+        "Metabolites Generated",
+        "Metabolite Bioactivation",
+        "Metabolite Escalations",
     ])?;
 
     for e in evals {
@@ -162,6 +167,40 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
                 s.lability_score
             )
         });
+        let tox21_alerts = e.tox21_summary.as_ref().map_or_else(String::new, |t| {
+            let mut all = t.endocrine_alerts.clone();
+            all.extend(t.stress_alerts.iter().cloned());
+            if all.is_empty() {
+                "0".to_string()
+            } else {
+                format!("{}: {}", all.len(), all.join("; "))
+            }
+        });
+        let sea_high = e.off_targets.as_ref().map_or_else(String::new, |o| {
+            let highs: Vec<&str> = o
+                .hits
+                .iter()
+                .filter(|h| h.risk == admet_calc::OffTargetRisk::High)
+                .map(|h| h.target_id.as_str())
+                .collect();
+            if highs.is_empty() {
+                "0".to_string()
+            } else {
+                format!("{}: {}", highs.len(), highs.join("; "))
+            }
+        });
+        let met_gen = e
+            .metabolite_guard
+            .as_ref()
+            .map_or_else(String::new, |m| m.total_generated.to_string());
+        let met_bio = e
+            .metabolite_guard
+            .as_ref()
+            .map_or_else(String::new, |m| m.bioactivation_alerts.to_string());
+        let met_esc = e
+            .metabolite_guard
+            .as_ref()
+            .map_or_else(String::new, |m| m.escalation_count.to_string());
         wtr.write_record(&[
             sanitize_csv_cell(&e.name),
             e.canonical_smiles.clone(),
@@ -259,6 +298,11 @@ pub fn export_csv_string(evals: &[MoleculeEvaluation]) -> Result<String, ReportE
             qval("solubility_aqsoldb"),
             qval("lipophilicity_astrazeneca"),
             sanitize_csv_cell(&top_som),
+            sanitize_csv_cell(&tox21_alerts),
+            sanitize_csv_cell(&sea_high),
+            met_gen,
+            met_bio,
+            met_esc,
         ])?;
     }
 

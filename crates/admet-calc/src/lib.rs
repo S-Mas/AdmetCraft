@@ -81,6 +81,9 @@ pub fn evaluate_molecule(mol: &Molecule) -> MoleculeEvaluation {
         qsar: None,
         metabolism_sites: Vec::new(),
         tpp_mpo: None,
+        tox21_summary: None,
+        off_targets: None,
+        metabolite_guard: None,
     }
 }
 

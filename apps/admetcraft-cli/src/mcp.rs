@@ -8,7 +8,9 @@ use std::time::Duration;
 use admet_calc::{MoleculeEvaluation, TppPreset};
 use admet_engine::{FilterCriteria, MAX_READ_BYTES, PathSandbox};
 use admet_qsar::{
-    compare_smiles_auto, evaluate_batch_auto, evaluate_smiles_auto, load_default_model_pack,
+    DEFAULT_MAX_METABOLITES, compare_smiles_auto, evaluate_batch_auto, evaluate_smiles_auto,
+    extract_mol_features, load_default_model_pack, load_default_sea_index,
+    predict_metabolism_sites, run_metabolite_guard,
 };
 use admet_report::{ExportFormat, write_report_to_writer};
 use chem_core::{parse_csv_batch, parse_sdf, parse_smiles, parse_smiles_batch};
@@ -677,6 +679,52 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["loaded", "endpoint_count"]
             }
+        },
+        {
+            "name": "predict_metabolites",
+            "description": "Predict Phase I & Phase II hepatic/plasma metabolites from SMILES and re-screen each metabolite for reactive bioactivation (epoxides, aniline N-OH, quinone-imines, acyl-glucuronides) and DILI/AMES/hERG toxicity escalation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smiles": { "type": "string" },
+                    "name": { "type": "string" },
+                    "max_metabolites": { "type": "integer", "minimum": 1, "maximum": 24 }
+                },
+                "required": ["smiles"]
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "total_generated": { "type": "integer" },
+                    "bioactivation_alerts": { "type": "integer" },
+                    "escalation_count": { "type": "integer" },
+                    "metabolites": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["total_generated", "bioactivation_alerts", "escalation_count", "metabolites"]
+            }
+        },
+        {
+            "name": "predict_offtargets",
+            "description": "Predict human off-target safety pharmacology risks via pure-Rust SEA (Similarity Ensemble Approach) against the Bowes Safety-20 anti-target reference panel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smiles": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "required": ["smiles"]
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "panel_version": { "type": "string" },
+                    "targets_evaluated": { "type": "integer" },
+                    "high_risk_count": { "type": "integer" },
+                    "moderate_risk_count": { "type": "integer" },
+                    "hits": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["panel_version", "targets_evaluated", "high_risk_count", "hits"]
+            }
         }
     ])
 }
@@ -708,6 +756,8 @@ fn call_tool(name: &str, args: &Value, sandbox: &PathSandbox) -> Result<Value, S
         "compare_molecules" => tool_compare_molecules(args),
         "export_report" => tool_export_report(args, sandbox),
         "model_info" => tool_model_info(),
+        "predict_metabolites" => tool_predict_metabolites(args),
+        "predict_offtargets" => tool_predict_offtargets(args),
         other => Err(format!("invalid params: unknown tool '{other}'")),
     }
 }
@@ -1059,6 +1109,9 @@ fn tool_inspect_molecule(args: &Value) -> Result<Value, String> {
             "qsar": eval.qsar,
             "metabolism_sites": eval.metabolism_sites,
             "tpp_mpo": eval.tpp_mpo,
+            "tox21_summary": eval.tox21_summary,
+            "off_targets": eval.off_targets,
+            "metabolite_guard": eval.metabolite_guard,
             "warnings": eval.warnings,
             "heavy_atoms": mol.heavy_atom_count(),
             "aromatic_heavy_atoms": mol.aromatic_heavy_atom_count(),
@@ -1176,4 +1229,71 @@ fn tool_export_report(args: &Value, sandbox: &PathSandbox) -> Result<Value, Stri
             "errors": errors,
         }),
     ))
+}
+
+fn tool_predict_metabolites(args: &Value) -> Result<Value, String> {
+    let Some(smi) = args
+        .get("smiles")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err("invalid params: missing required non-empty string 'smiles'".to_string());
+    };
+    let name = parse_optional_string(args, "name")?;
+    let max_met =
+        parse_optional_non_neg_usize(args, "max_metabolites")?.unwrap_or(DEFAULT_MAX_METABOLITES);
+    let mut mol = match parse_smiles(smi) {
+        Ok(m) => m,
+        Err(e) => return Ok(tool_err(format!("invalid SMILES: {e}"))),
+    };
+    if let Some(n) = name {
+        mol.name = Some(n.to_string());
+    }
+    let pack = load_default_model_pack();
+    let mut parent_eval = admet_calc::evaluate_molecule(&mol);
+    if let Some(mp) = pack {
+        let feat = extract_mol_features(&mol, &parent_eval);
+        parent_eval.qsar = Some(mp.predict_all(&feat, "mcp"));
+    }
+    let sites = predict_metabolism_sites(&mol);
+    let report = run_metabolite_guard(&mol, &parent_eval, &sites, pack, max_met);
+    let summary = format!(
+        "Generated {} metabolite(s) for {} ({} bioactivation, {} escalation)",
+        report.total_generated,
+        parent_eval.name,
+        report.bioactivation_alerts,
+        report.escalation_count
+    );
+    let payload = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
+    Ok(tool_ok(summary, payload))
+}
+
+fn tool_predict_offtargets(args: &Value) -> Result<Value, String> {
+    let Some(smi) = args
+        .get("smiles")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err("invalid params: missing required non-empty string 'smiles'".to_string());
+    };
+    let name = parse_optional_string(args, "name")?;
+    let mut mol = match parse_smiles(smi) {
+        Ok(m) => m,
+        Err(e) => return Ok(tool_err(format!("invalid SMILES: {e}"))),
+    };
+    if let Some(n) = name {
+        mol.name = Some(n.to_string());
+    }
+    let report = load_default_sea_index().predict_molecule(&mol);
+    let summary = format!(
+        "SEA off-target scan for {}: {} High-risk, {} Moderate-risk across {} targets",
+        mol.name.as_deref().unwrap_or("Query"),
+        report.high_risk_count,
+        report.moderate_risk_count,
+        report.targets_evaluated
+    );
+    let payload = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
+    Ok(tool_ok(summary, payload))
 }

@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use admet_calc::{
-    ApplicabilityDomain, ApplicabilityDomainStatus, QsarAdmetReport, QsarTaskKind,
+    ApplicabilityDomain, ApplicabilityDomainStatus, QsarAdmetReport, QsarTaskKind, Tox21Summary,
     evaluate_molecule,
 };
 use chem_core::parse_smiles;
@@ -29,7 +29,7 @@ pub enum QsarError {
     Dataset { endpoint: String, message: String },
 }
 
-/// Specification of one official TDC ADMET endpoint.
+/// Specification of one official TDC ADMET or Tox21 endpoint.
 #[derive(Debug, Clone, Copy)]
 pub struct TdcEndpointSpec {
     pub id: &'static str,
@@ -40,9 +40,12 @@ pub struct TdcEndpointSpec {
     pub units: &'static str,
     pub log10_transform: bool,
     pub species_filter: Option<&'static str>,
+    /// Optional explicit label column name for multi-task TDC tables (e.g. `tox21.tab`);
+    /// when `None`, defaults to standard TDC `"Y"` column.
+    pub target_col: Option<&'static str>,
 }
 
-/// All 20 official Therapeutics Data Commons (TDC) ADMET benchmark endpoints.
+/// All 32 official Therapeutics Data Commons (TDC) endpoints: 20 core ADMET + 12 Tox21 pathways.
 pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
     TdcEndpointSpec {
         id: "herg_karim",
@@ -53,6 +56,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "ames",
@@ -63,6 +67,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "dili",
@@ -73,6 +78,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "clintox",
@@ -83,6 +89,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "cyp1a2_veith",
@@ -93,6 +100,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "cyp2c9_veith",
@@ -103,6 +111,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "cyp2c19_veith",
@@ -113,6 +122,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "cyp2d6_veith",
@@ -123,6 +133,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "cyp3a4_veith",
@@ -133,6 +144,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "pgp_broccatelli",
@@ -143,6 +155,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "hia_hou",
@@ -153,6 +166,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "bioavailability_ma",
@@ -163,6 +177,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "caco2_wang",
@@ -173,6 +188,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "log(cm/s)",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "bbb_martins",
@@ -183,6 +199,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "prob",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "ppbr_az",
@@ -193,6 +210,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "%",
         log10_transform: false,
         species_filter: Some("Homo sapiens"),
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "vdss_lombardo",
@@ -203,6 +221,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "L/kg",
         log10_transform: true,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "clearance_microsome_az",
@@ -213,6 +232,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "uL/min/mg",
         log10_transform: true,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "half_life_obach",
@@ -223,6 +243,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "h",
         log10_transform: true,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "solubility_aqsoldb",
@@ -233,6 +254,7 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "log(mol/L)",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
     },
     TdcEndpointSpec {
         id: "lipophilicity_astrazeneca",
@@ -243,6 +265,141 @@ pub const TDC_ENDPOINTS: &[TdcEndpointSpec] = &[
         units: "LogD7.4",
         log10_transform: false,
         species_filter: None,
+        target_col: None,
+    },
+    // --- Tox21 Nuclear Receptors (Endocrine / Metabolic Disruption, 7 assays) ---
+    TdcEndpointSpec {
+        id: "tox21_nr_ar",
+        file_name: "tox21.tab",
+        display_name: "Tox21 NR-AR (Androgen Receptor)",
+        category: "Tox21-NR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("NR-AR"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_nr_ar_lbd",
+        file_name: "tox21.tab",
+        display_name: "Tox21 NR-AR-LBD (Androgen LBD)",
+        category: "Tox21-NR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("NR-AR-LBD"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_nr_ahr",
+        file_name: "tox21.tab",
+        display_name: "Tox21 NR-AhR (Aryl Hydrocarbon R.)",
+        category: "Tox21-NR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("NR-AhR"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_nr_aromatase",
+        file_name: "tox21.tab",
+        display_name: "Tox21 NR-Aromatase Inhibition",
+        category: "Tox21-NR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("NR-Aromatase"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_nr_er",
+        file_name: "tox21.tab",
+        display_name: "Tox21 NR-ER (Estrogen Receptor)",
+        category: "Tox21-NR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("NR-ER"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_nr_er_lbd",
+        file_name: "tox21.tab",
+        display_name: "Tox21 NR-ER-LBD (Estrogen LBD)",
+        category: "Tox21-NR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("NR-ER-LBD"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_nr_ppar_gamma",
+        file_name: "tox21.tab",
+        display_name: "Tox21 NR-PPAR-gamma",
+        category: "Tox21-NR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("NR-PPAR-gamma"),
+    },
+    // --- Tox21 Cellular Stress Response Pathways (5 assays) ---
+    TdcEndpointSpec {
+        id: "tox21_sr_are",
+        file_name: "tox21.tab",
+        display_name: "Tox21 SR-ARE (Oxidative Stress / Nrf2)",
+        category: "Tox21-SR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("SR-ARE"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_sr_atad5",
+        file_name: "tox21.tab",
+        display_name: "Tox21 SR-ATAD5 (Genotoxicity / DNA)",
+        category: "Tox21-SR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("SR-ATAD5"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_sr_hse",
+        file_name: "tox21.tab",
+        display_name: "Tox21 SR-HSE (Heat Shock Response)",
+        category: "Tox21-SR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("SR-HSE"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_sr_mmp",
+        file_name: "tox21.tab",
+        display_name: "Tox21 SR-MMP (Mitochondrial Toxicity)",
+        category: "Tox21-SR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("SR-MMP"),
+    },
+    TdcEndpointSpec {
+        id: "tox21_sr_p53",
+        file_name: "tox21.tab",
+        display_name: "Tox21 SR-p53 (p53 DNA Damage)",
+        category: "Tox21-SR",
+        task: QsarTaskKind::BinaryClassification,
+        units: "prob",
+        log10_transform: false,
+        species_filter: None,
+        target_col: Some("SR-p53"),
     },
 ];
 
@@ -325,7 +482,7 @@ impl AdmetModelPack {
     #[must_use]
     pub fn render_validation_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("# AdmetCraft v1.0 — TDC QSAR Validation Report (Bemis-Murcko Scaffold Split 70/10/20)\n\n");
+        out.push_str("# AdmetCraft v1.1 — TDC QSAR & Tox21 Validation Report (Bemis-Murcko Scaffold Split 70/10/20)\n\n");
         out.push_str(&format!(
             "- **Model Pack Version:** `{}` | **Split:** `{}` | **Endpoints:** `{}`\n\n",
             self.version,
@@ -437,8 +594,48 @@ fn unquote(s: &str) -> &str {
     s.trim().trim_matches('"').trim()
 }
 
-/// Parses a TDC `.tab` file into `(smiles, target_y)` rows with optional species filtering
-/// and `log10` transformation.
+/// Summarizes the 12 Tox21 Nuclear Receptor (`Tox21-NR`) and Cellular Stress (`Tox21-SR`)
+/// assays from a QSAR report, returning `None` if no Tox21 endpoints are loaded.
+#[must_use]
+pub fn summarize_tox21(report: &QsarAdmetReport) -> Option<Tox21Summary> {
+    let mut evaluated = 0usize;
+    let mut endocrine_alerts = Vec::new();
+    let mut stress_alerts = Vec::new();
+    let mut max_prob = 0.0_f64;
+
+    for ep in &report.endpoints {
+        if !ep.endpoint_id.starts_with("tox21_") {
+            continue;
+        }
+        evaluated += 1;
+        if ep.value > max_prob {
+            max_prob = ep.value;
+        }
+        // Flag assay when predicted probability >= 0.50 and conformal set is not confidently Negative
+        if ep.value >= 0.50 && ep.conformal_call != "Negative" {
+            let tag = format!("{} (P={:.2})", ep.display_name, ep.value);
+            if ep.category == "Tox21-NR" {
+                endocrine_alerts.push(tag);
+            } else {
+                stress_alerts.push(tag);
+            }
+        }
+    }
+
+    if evaluated == 0 {
+        None
+    } else {
+        Some(Tox21Summary {
+            assays_evaluated: evaluated,
+            endocrine_alerts,
+            stress_alerts,
+            max_probability: (max_prob * 1000.0).round() / 1000.0,
+        })
+    }
+}
+
+/// Parses a TDC `.tab` file into `(smiles, target_y)` rows with optional species filtering,
+/// multi-task column selection (`spec.target_col`), and `log10` transformation.
 pub fn parse_tdc_tab(path: &Path, spec: &TdcEndpointSpec) -> Result<Vec<(String, f64)>, QsarError> {
     let raw = std::fs::read_to_string(path)?;
     let mut lines = raw.lines();
@@ -457,10 +654,18 @@ pub fn parse_tdc_tab(path: &Path, spec: &TdcEndpointSpec) -> Result<Vec<(String,
                 || c.eq_ignore_ascii_case("SMILES")
         })
         .unwrap_or(1);
-    let y_idx = cols
-        .iter()
-        .position(|&c| c.eq_ignore_ascii_case("Y"))
-        .unwrap_or(2);
+    let y_idx = if let Some(req_col) = spec.target_col {
+        cols.iter()
+            .position(|&c| c.eq_ignore_ascii_case(req_col))
+            .ok_or_else(|| QsarError::Dataset {
+                endpoint: spec.id.to_string(),
+                message: format!("required multi-task column '{req_col}' not found in header"),
+            })?
+    } else {
+        cols.iter()
+            .position(|&c| c.eq_ignore_ascii_case("Y"))
+            .unwrap_or(2)
+    };
     let sp_idx = cols.iter().position(|&c| c.eq_ignore_ascii_case("Species"));
 
     let mut out = Vec::new();
@@ -482,7 +687,12 @@ pub fn parse_tdc_tab(path: &Path, spec: &TdcEndpointSpec) -> Result<Vec<(String,
         if smi.is_empty() {
             continue;
         }
-        let Ok(mut y) = unquote(fields[y_idx]).parse::<f64>() else {
+        let raw_y = unquote(fields[y_idx]);
+        if raw_y.is_empty() || raw_y.eq_ignore_ascii_case("nan") || raw_y.eq_ignore_ascii_case("na")
+        {
+            continue;
+        }
+        let Ok(mut y) = raw_y.parse::<f64>() else {
             continue;
         };
         if !y.is_finite() {
@@ -682,4 +892,43 @@ pub fn train_tdc_model_pack(
         std::fs::write(md_path, pack.render_validation_markdown())?;
     }
     Ok(pack)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tdc_tab_reads_multitask_tox21_columns_and_skips_missing_cells()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let p = std::env::temp_dir().join("admetcraft_tox21_parse_test.tab");
+        let content = "Drug_ID\tDrug\tNR-AR\tSR-MMP\n\
+                       c1\tCCO\t0\t1\n\
+                       c2\tc1ccccc1\t\t0\n\
+                       c3\tCC(=O)O\tNaN\t1\n\
+                       c4\tNc1ccccc1\t1\tNA\n";
+        std::fs::write(&p, content)?;
+
+        let nr_ar = TDC_ENDPOINTS
+            .iter()
+            .find(|e| e.id == "tox21_nr_ar")
+            .ok_or("missing tox21_nr_ar spec")?;
+        let sr_mmp = TDC_ENDPOINTS
+            .iter()
+            .find(|e| e.id == "tox21_sr_mmp")
+            .ok_or("missing tox21_sr_mmp spec")?;
+
+        let rows_ar = parse_tdc_tab(&p, nr_ar)?;
+        let rows_mmp = parse_tdc_tab(&p, sr_mmp)?;
+        let _ = std::fs::remove_file(&p);
+
+        assert_eq!(rows_ar.len(), 2);
+        assert_eq!(rows_ar[0].0, "CCO");
+        assert!((rows_ar[0].1 - 0.0).abs() < 1e-9);
+        assert_eq!(rows_ar[1].0, "Nc1ccccc1");
+        assert!((rows_ar[1].1 - 1.0).abs() < 1e-9);
+
+        assert_eq!(rows_mmp.len(), 3);
+        Ok(())
+    }
 }

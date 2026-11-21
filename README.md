@@ -1,8 +1,12 @@
-# AdmetCraft v1.0.0
+# AdmetCraft v1.1.0
 
-**Local-First, Pure-Rust Quantitative ADMET, QSAR (TDC + 90% Conformal CI + Applicability Domain), Sites of Metabolism & TPP MPO Workbench** (`#![forbid(unsafe_code)]`).
+**Local-First, Pure-Rust Quantitative ADMET, QSAR + Tox21 (32 TDC Endpoints + 90% Conformal CI + Applicability Domain), SEA Off-Target Fishing, Phase I/II Metabolite Guard & TPP MPO Workbench** (`#![forbid(unsafe_code)]`).
 
-**AdmetCraft v1.0** combines exact physicochemical, ionization ($\text{p}K_a$/$\log D_{7.4}$), solubility, druglikeness (**QED**, **Pfizer CNS MPO**, **Lipinski/Ghose/Veber/Egan/Muegge**, **Pfizer 3/75**, **GSK 4/400**, **Golden Triangle**, **Ro3**, **bRo5**), and structural alerts (**PAINS** / **Brenk**) with a **100% pure-Rust trained QSAR GBDT suite over 20 Therapeutics Data Commons (TDC) ADMET endpoints**, **Split Conformal Prediction (90% CI / prediction sets)**, **ECFP4 Tanimoto Applicability Domain**, **atomic Sites of Metabolism (CYP450 + Phase II UGT/Esterase)**, and configurable **Target Product Profile (`TPP MPO`)** scoring—completely offline across all CPU cores with zero data leaving your machine.
+**AdmetCraft v1.1** combines exact physicochemical, ionization ($\text{p}K_a$/$\log D_{7.4}$), solubility, druglikeness (**QED**, **Pfizer CNS MPO**, **Lipinski/Ghose/Veber/Egan/Muegge**, **Pfizer 3/75**, **GSK 4/400**, **Golden Triangle**, **Ro3**, **bRo5**), and structural alerts (**PAINS** / **Brenk**) with:
+- **32 pure-Rust trained TDC QSAR GBDT models** (20 core ADMET + **12 Tox21 Nuclear Receptor & Cellular Stress pathways**, mean held-out Bemis-Murcko scaffold **ROC AUC = 0.833**, mean 90% conformal coverage **92.7%**),
+- **Local SEA (*Similarity Ensemble Approach*) Off-Target Fishing** against the curated **Bowes Safety-20** human anti-target panel (`< 2 ms`/compound, hardware POPCNT ECFP4 Tanimoto + Gumbel E-values, extensible via `build-sea-index`),
+- **Phase I/II Metabolite Guard** (11 deterministic graph biotransformations: benzylic/allylic/aromatic hydroxylation, O-/N-dealkylation, furan/thiophene/alkene epoxidation, aniline N-hydroxylation, thioether S-oxidation, ester hydrolysis, phenolic O-glucuronidation/sulfation, acyl-glucuronidation, and NAPQI-type quinone-imine oxidation — automatically re-screened for reactive bioactivation & DILI/AMES/hERG toxicity escalation),
+- **Atomic Sites of Metabolism (SoM)** and configurable **Target Product Profile (`TPP MPO`)** scoring—completely offline across all CPU cores.
 
 ---
 
@@ -18,9 +22,15 @@
 
 ---
 
-## Quantitative QSAR Validation (20 Official TDC ADMET Endpoints, 108,825 Compounds)
+## Quantitative QSAR & Tox21 Validation (32 Official TDC Endpoints)
 
-All 20 models are trained locally in pure Rust (`admetcraft-cli train-qsar`, ~16 s on 24 threads) using a strict **zero-leakage Bemis-Murcko Scaffold Split (70% train / 10% conformal calibration / 20% held-out test)**:
+All **32 models** (20 core ADMET + **12 official Tox21 cellular toxicity & nuclear receptor pathways**) are trained locally in pure Rust (`admetcraft-cli train-qsar`, ~22 s on 24 threads) using a strict **zero-leakage Bemis-Murcko Scaffold Split (70% train / 10% conformal calibration / 20% held-out test)**.
+
+- **Pre-trained model pack download:** Download `admetcraft-tdc-models-v1.1.0.json.gz` from the GitHub Release assets, decompress (`gunzip`), and place at `$CRAFT_DATA_DIR/models/admetcraft_v1/admetcraft_tdc_v1.json` (default `/home/acs/Datos/CraftBio/models/admetcraft_v1/admetcraft_tdc_v1.json`).
+- **Re-training from raw TDC datasets:** Raw `.tab` files originate from official Harvard Dataverse / [Therapeutics Data Commons (`PyTDC`)](https://tdcommons.ai) (including `tox21.tab`, Dataverse ID `4259612`), placed in `$CRAFT_DATA_DIR/models/tdc_raw/`.
+- **v1.1.0 Held-Out Scaffold Summary (32 endpoints):** Mean Classification Scaffold **ROC AUC = 0.833** (`25` endpoints: `0.856` on 13 core ADMET, `0.811` across 12 Tox21 incl. `SR-MMP 0.906` & `NR-AhR 0.902`) | Mean Regression Scaffold **Spearman ρ = 0.668** (`7` endpoints) | Mean **90% Split-Conformal Coverage = 92.7%**.
+
+### Core 20 ADMET Endpoints Reference Table
 
 | Endpoint | Category | Task | Train / Cal / Test | Held-Out Scaffold Metric | Secondary Metric | 90% Conformal Cov. |
 |---|---|---|---:|---:|---:|---:|

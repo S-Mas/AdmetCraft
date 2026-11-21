@@ -1351,6 +1351,125 @@ impl AdmetCraftApp {
                         }
                     });
                 });
+
+                // 4. Tox21 Cellular & Endocrine Disruption Pathways (12 assays)
+                if let Some(tox21) = &eval.tox21_summary {
+                    ui.separator();
+                    let n_alerts = tox21.endocrine_alerts.len() + tox21.stress_alerts.len();
+                    egui::CollapsingHeader::new(format!(
+                        "Tox21 Cellular & Endocrine Pathways ({} assays, {} alert(s), max P={:.2})",
+                        tox21.assays_evaluated, n_alerts, tox21.max_probability
+                    ))
+                    .default_open(n_alerts > 0)
+                    .show(ui, |ui| {
+                        if n_alerts == 0 {
+                            ui.colored_label(
+                                Color32::from_rgb(45, 145, 75),
+                                "No Nuclear Receptor (NR) or Stress Response (SR) alerts above P=0.50.",
+                            );
+                        } else {
+                            for a in &tox21.endocrine_alerts {
+                                ui.colored_label(Color32::from_rgb(195, 50, 50), format!("NR Alert: {a}"));
+                            }
+                            for a in &tox21.stress_alerts {
+                                ui.colored_label(Color32::from_rgb(195, 50, 50), format!("SR Alert: {a}"));
+                            }
+                        }
+                    });
+                }
+
+                // 5. SEA Off-Target Safety Pharmacology (Bowes Safety-20)
+                if let Some(sea) = &eval.off_targets {
+                    ui.separator();
+                    egui::CollapsingHeader::new(format!(
+                        "SEA Off-Target Fishing — {} ({} High, {} Moderate / {} targets)",
+                        sea.panel_version,
+                        sea.high_risk_count,
+                        sea.moderate_risk_count,
+                        sea.targets_evaluated
+                    ))
+                    .default_open(sea.high_risk_count > 0)
+                    .show(ui, |ui| {
+                        if sea.hits.is_empty() {
+                            ui.colored_label(
+                                Color32::from_rgb(45, 145, 75),
+                                "No significant off-target similarity alerts detected across Bowes Safety-20.",
+                            );
+                        } else {
+                            egui::Grid::new("sea_offtarget_grid")
+                                .striped(true)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    for h in ["Target", "Risk", "Max Tc", "Z-Score", "Nearest Drug", "Organ Liability"] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for hit in &sea.hits {
+                                        ui.monospace(&hit.target_id);
+                                        let col = match hit.risk {
+                                            admet_calc::OffTargetRisk::High => Color32::from_rgb(195, 50, 50),
+                                            admet_calc::OffTargetRisk::Moderate => Color32::from_rgb(185, 125, 20),
+                                            admet_calc::OffTargetRisk::Low => Color32::from_rgb(120, 120, 130),
+                                        };
+                                        ui.colored_label(col, RichText::new(hit.risk.as_str()).strong());
+                                        ui.monospace(format!("{:.3}", hit.max_tanimoto));
+                                        ui.monospace(format!("{:+.2}", hit.z_score));
+                                        ui.label(&hit.nearest_ligand);
+                                        ui.weak(&hit.organ_liability);
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                    });
+                }
+
+                // 6. Phase I/II Metabolite Guard (Biotransformation -> Re-Screening)
+                if let Some(mg) = &eval.metabolite_guard {
+                    ui.separator();
+                    egui::CollapsingHeader::new(format!(
+                        "Metabolite Guard — {} generated ({} bioactivation, {} escalation)",
+                        mg.total_generated, mg.bioactivation_alerts, mg.escalation_count
+                    ))
+                    .default_open(mg.bioactivation_alerts > 0 || mg.escalation_count > 0)
+                    .show(ui, |ui| {
+                        if mg.metabolites.is_empty() {
+                            ui.weak("No major Phase I/II biotransformation products generated.");
+                        } else {
+                            egui::Grid::new("metabolite_guard_grid")
+                                .striped(true)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    for h in ["#", "Phase", "Reaction", "Bioact.", "DILI / AMES", "Metabolite SMILES"] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for m in &mg.metabolites {
+                                        ui.monospace(format!("{}", m.rank));
+                                        ui.label(m.phase.as_str());
+                                        ui.label(&m.reaction);
+                                        if m.reactive_bioactivation {
+                                            ui.colored_label(
+                                                Color32::from_rgb(195, 50, 50),
+                                                RichText::new("ALERT").strong(),
+                                            );
+                                        } else if m.toxicity_escalation {
+                                            ui.colored_label(
+                                                Color32::from_rgb(185, 125, 20),
+                                                RichText::new("ESC").strong(),
+                                            );
+                                        } else {
+                                            ui.colored_label(Color32::from_rgb(45, 145, 75), "OK");
+                                        }
+                                        let dp = m.dili_prob.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+                                        let ap = m.ames_prob.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+                                        ui.monospace(format!("{dp} / {ap}"));
+                                        ui.monospace(&m.smiles);
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                    });
+                }
             });
     }
 

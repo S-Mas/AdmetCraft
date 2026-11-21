@@ -528,6 +528,116 @@ pub struct TppMpoReport {
     pub criteria: Vec<TppCriterionResult>,
 }
 
+/// Consolidated summary of Tox21 cellular toxicity & endocrine disruption pathways (12 assays).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Tox21Summary {
+    pub assays_evaluated: usize,
+    /// Flagged Nuclear Receptor (endocrine/metabolic disruption) assays (`NR-*`).
+    pub endocrine_alerts: Vec<String>,
+    /// Flagged Cellular Stress Response assays (`SR-*`: oxidative, genotoxic, mitochondrial, p53).
+    pub stress_alerts: Vec<String>,
+    /// Maximum predicted Tox21 probability across all evaluated assays `[0.0, 1.0]`.
+    pub max_probability: f64,
+}
+
+/// Risk tier for a predicted off-target liability via SEA (Similarity Ensemble Approach).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OffTargetRisk {
+    #[default]
+    Low,
+    Moderate,
+    High,
+}
+
+impl OffTargetRisk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Moderate => "Moderate",
+            Self::High => "High",
+        }
+    }
+}
+
+/// Single predicted human off-target hit from pure-Rust SEA ligand-set similarity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OffTargetHit {
+    pub target_id: String,
+    pub target_name: String,
+    pub target_class: String,
+    pub organ_liability: String,
+    /// Highest ECFP4 Tanimoto similarity to any known active reference ligand of this target.
+    pub max_tanimoto: f64,
+    /// Name of the closest known active ligand driving this alert.
+    pub nearest_ligand: String,
+    /// Raw SEA sum of above-threshold Tanimoto similarities.
+    pub raw_score: f64,
+    /// Background-calibrated SEA Z-score.
+    pub z_score: f64,
+    /// Analytical extreme-value distribution (Gumbel) E-value (smaller = stronger off-target match).
+    pub e_value: f64,
+    pub risk: OffTargetRisk,
+}
+
+/// Complete local SEA off-target safety pharmacology profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct OffTargetReport {
+    pub panel_version: String,
+    pub targets_evaluated: usize,
+    pub high_risk_count: usize,
+    pub moderate_risk_count: usize,
+    pub hits: Vec<OffTargetHit>,
+}
+
+/// Metabolic biotransformation phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MetabolismPhase {
+    #[default]
+    PhaseI,
+    PhaseII,
+}
+
+impl MetabolismPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PhaseI => "Phase I",
+            Self::PhaseII => "Phase II",
+        }
+    }
+}
+
+/// Single predicted hepatic/plasma metabolite re-screened for toxicity escalation & bioactivation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictedMetabolite {
+    pub rank: usize,
+    pub smiles: String,
+    pub phase: MetabolismPhase,
+    pub reaction: String,
+    pub enzyme: String,
+    pub parent_som_atom: usize,
+    pub lability_score: f64,
+    /// True if transformation creates a reactive electrophile / covalent-binding bioactivation species.
+    pub reactive_bioactivation: bool,
+    pub bioactivation_reason: Option<String>,
+    pub dili_prob: Option<f64>,
+    pub ames_prob: Option<f64>,
+    pub herg_prob: Option<f64>,
+    pub max_tox21_prob: Option<f64>,
+    /// Structural alerts (PAINS/Brenk/AMES/DILI) present in the metabolite but absent in the parent.
+    pub new_alerts: Vec<String>,
+    /// True if metabolite introduces reactive bioactivation, new alerts, or significant toxicity jump.
+    pub toxicity_escalation: bool,
+}
+
+/// Complete Phase I/II Metabolite Guard report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MetaboliteGuardReport {
+    pub total_generated: usize,
+    pub bioactivation_alerts: usize,
+    pub escalation_count: usize,
+    pub metabolites: Vec<PredictedMetabolite>,
+}
+
 /// Complete ADMET evaluation for one molecule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeEvaluation {
@@ -557,6 +667,15 @@ pub struct MoleculeEvaluation {
     /// Target Product Profile (TPP) Multiparameter Optimization scorecard.
     #[serde(default)]
     pub tpp_mpo: Option<TppMpoReport>,
+    /// Consolidated Tox21 cellular toxicity & nuclear-receptor pathway summary (12 assays).
+    #[serde(default)]
+    pub tox21_summary: Option<Tox21Summary>,
+    /// Local pure-Rust SEA off-target safety pharmacology profile (Safety-20 / ChEMBL panel).
+    #[serde(default)]
+    pub off_targets: Option<OffTargetReport>,
+    /// Phase I/II biotransformation & metabolite toxicity escalation guard.
+    #[serde(default)]
+    pub metabolite_guard: Option<MetaboliteGuardReport>,
 }
 
 /// Side-by-side ADMET delta between two molecules (e.g. parent vs analogue / bioisostere).
